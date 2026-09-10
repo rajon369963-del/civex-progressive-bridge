@@ -13,9 +13,10 @@ Enforces 7 Invariants (Zero Warnings, Zero Assert statements, Strict Exit 1 on A
 8. Durable presence of tool_traces_v2 summary record
 """
 import sys, os, sqlite3, json, re
+from pathlib import Path
 
-DB_PATH = "/Users/rajondas/.antigravity/air10_audit.db"
-SHIM_LOG = "/Users/rajondas/.antigravity/shim_intercept.log"
+DB_PATH = str(Path.home() / ".antigravity" / "air10_audit.db")
+SHIM_LOG = str(Path.home() / ".antigravity" / "shim_intercept.log")
 
 EXPECTED_STAGES = ["INTENT", "ROUTER_EVALUATION", "SHIM_INTERCEPT", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"]
 
