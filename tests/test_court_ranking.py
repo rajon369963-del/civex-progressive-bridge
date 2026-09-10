@@ -40,7 +40,7 @@ def hermetic_court_env(tmp_path):
             binary_path TEXT NOT NULL,
             binary_sha256 TEXT,
             input_path TEXT NOT NULL,
-            input_sha256 TEXT NOT NULL,
+            input_sha256 TEXT,
             stdout_sha256 TEXT,
             actual_exit_code INTEGER NOT NULL,
             duration_ms REAL NOT NULL,

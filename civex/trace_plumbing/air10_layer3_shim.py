@@ -14,22 +14,24 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SHIM_LOG = os.environ.get("AIR10_SHIM_LOG", os.path.expanduser("~/.antigravity/shim_intercept.log"))
 
-def shim_intercept(trace_id, tool_name, binary_path, command_args, parent_span_id=None):
+def shim_intercept(trace_id, tool_name, binary_path, command_args, parent_span_id=None, db_path=None, shim_log=None):
     span_id = f"span_shim_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     pid = os.getpid()
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
+    active_db = db_path or os.environ.get("AIR10_AUDIT_DB", DB_PATH)
+    active_shim = shim_log or os.environ.get("AIR10_SHIM_LOG", SHIM_LOG)
 
     # 1. Correlated physical append to shim_intercept.log if directory exists
     try:
-        log_dir = os.path.dirname(SHIM_LOG)
+        log_dir = os.path.dirname(active_shim)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
-        shim_entry = f"[{now_iso}] PID:{pid} TRACE:{trace_id} PARENT:{effective_parent or 'NONE'} SHIM:{tool_name} BIN:{binary_path} ARGS:{command_args}\n"
-        with open(SHIM_LOG, "a", encoding="utf-8") as f:
+        shim_entry = f"[{now_iso}] PID:{pid} TRACE:{trace_id} SPAN:{span_id} PARENT:{effective_parent or 'NONE'} SHIM:{tool_name} BIN:{binary_path} ARGS:{command_args}\n"
+        with open(active_shim, "a", encoding="utf-8") as f:
             f.write(shim_entry)
     except Exception as e:
-        sys.stderr.write(f"SHIM_LOG_FAILURE: Unable to append to {SHIM_LOG}: {e}\n")
+        sys.stderr.write(f"SHIM_LOG_FAILURE: Unable to append to {active_shim}: {e}\n")
         raise RuntimeError(f"FAIL-CLOSED: Shim log write failure: {e}") from e
 
     # 2. Compute binary SHA-256 if file exists
@@ -40,18 +42,20 @@ def shim_intercept(trace_id, tool_name, binary_path, command_args, parent_span_i
 
     details = {
         "tool_name": tool_name,
+        "target_bin": binary_path,
         "binary_path": binary_path,
         "binary_sha256": bin_sha256,
         "command_args": command_args,
         "shim_pid": pid,
+        "parent_pid": pid,
         "parent_span_id": effective_parent,
         "env_trace_id": os.environ.get("AIR10_TRACE_ID", trace_id),
     }
     payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
 
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
+    if os.path.exists(active_db):
+        conn = sqlite3.connect(active_db)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trace_events 

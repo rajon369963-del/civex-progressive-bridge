@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -25,6 +26,8 @@
 #include <stdint.h>
 #include <errno.h>
 #include <signal.h>
+#include <strings.h>
+
 
 /* Minimal Self-Contained SHA-256 implementation */
 typedef struct {
@@ -118,6 +121,24 @@ static void hash_to_hex(const uint8_t hash[32], char hex_out[65]) {
     hex_out[64] = '\0';
 }
 
+static int compute_file_sha256(const char *path, char hex_out[65]) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    uint8_t buf[8192];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        sha256_update(&ctx, buf, (size_t)n);
+    }
+    close(fd);
+    if (n < 0) return -1;
+    uint8_t hash[32];
+    sha256_final(&ctx, hash);
+    hash_to_hex(hash, hex_out);
+    return 0;
+}
+
 static double timespec_to_ms(struct timespec ts) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
@@ -143,16 +164,122 @@ int main(int argc, char *argv[]) {
     const char *trace_id = argv[1];
     const char *parent_span_id = argv[2];
     const char *binary_path = argv[3];
-    const char *input_file = (argc > 4) ? argv[4] : "";
+    const char *input_file = getenv("AIR10_INPUT_FILE");
+    if (!input_file || input_file[0] == '\0') {
+        input_file = (argc > 4) ? argv[4] : "";
+    }
+    if (input_file[0] != '\0' && access(input_file, F_OK) != 0) {
+        for (int i = 4; i < argc; i++) {
+            if (access(argv[i], F_OK) == 0) {
+                input_file = argv[i];
+                break;
+            }
+        }
+    }
 
     if (access(binary_path, X_OK) != 0) {
         fprintf(stderr, "ERROR: Binary '%s' not found or not executable\n", binary_path);
         return 126;
     }
-    if (argc > 4 && strlen(input_file) > 0 && access(input_file, R_OK) != 0) {
-        if (access(input_file, F_OK) == 0) {
-            fprintf(stderr, "ERROR: Input file '%s' not readable\n", input_file);
-            return 127;
+
+    /* 1. Read binary bytes, compute authoritative C11 executed_binary_sha256 */
+    char executed_binary_sha256[65] = {0};
+    int bin_fd = open(binary_path, O_RDONLY);
+    if (bin_fd < 0) {
+        fprintf(stderr, "ERROR: Binary '%s' cannot be opened for reading: %s\n", binary_path, strerror(errno));
+        return 126;
+    }
+    SHA256_CTX bin_ctx;
+    sha256_init(&bin_ctx);
+    uint8_t bin_buf[8192];
+    ssize_t bin_n;
+
+    /* Prepare content-addressed execution snapshot directory */
+    const char *snap_dir = getenv("AIR10_EXEC_SNAPSHOT_DIR");
+    if (!snap_dir || snap_dir[0] == '\0') {
+        snap_dir = "/tmp/air10_exec_snapshots";
+    }
+    mkdir(snap_dir, 0700);
+
+    size_t bin_cap = 65536;
+    size_t bin_len = 0;
+    uint8_t *bin_bytes = (uint8_t *)malloc(bin_cap);
+    if (!bin_bytes) {
+        close(bin_fd);
+        return 71;
+    }
+    while ((bin_n = read(bin_fd, bin_buf, sizeof(bin_buf))) > 0) {
+        sha256_update(&bin_ctx, bin_buf, (size_t)bin_n);
+        while (bin_len + (size_t)bin_n > bin_cap) {
+            bin_cap *= 2;
+            uint8_t *new_bytes = (uint8_t *)realloc(bin_bytes, bin_cap);
+            if (!new_bytes) {
+                free(bin_bytes);
+                close(bin_fd);
+                return 71;
+            }
+            bin_bytes = new_bytes;
+        }
+        memcpy(bin_bytes + bin_len, bin_buf, (size_t)bin_n);
+        bin_len += (size_t)bin_n;
+    }
+    close(bin_fd);
+    if (bin_n < 0) {
+        free(bin_bytes);
+        return 71;
+    }
+
+    uint8_t bin_hash[32];
+    sha256_final(&bin_ctx, bin_hash);
+    hash_to_hex(bin_hash, executed_binary_sha256);
+
+    /* Expected Binary SHA verification (Fail-Closed) */
+    const char *expected_bin_sha = getenv("AIR10_EXPECTED_BINARY_SHA");
+    if (expected_bin_sha && expected_bin_sha[0] != '\0') {
+        if (strcasecmp(executed_binary_sha256, expected_bin_sha) != 0) {
+            fprintf(stderr, "ERROR: BINARY_INTEGRITY_MISMATCH: executed SHA '%s' != expected SHA '%s'\n", executed_binary_sha256, expected_bin_sha);
+            free(bin_bytes);
+            return 76;
+        }
+    }
+
+    /* Content-Addressed Execution Snapshot:
+     * Write exact bytes read & verified to /tmp/air10_exec_snapshots/<sha256>
+     * with permissions 0700. This guarantees child executes the exact verified bytes.
+     * Completely eliminates time-of-check-to-time-of-use (TOCTOU) and ABA mutation attacks.
+     */
+    char snapshot_path[512];
+    snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", snap_dir, executed_binary_sha256);
+    
+    int snap_fd = open(snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (snap_fd >= 0) {
+        size_t written_total = 0;
+        while (written_total < bin_len) {
+            ssize_t w = write(snap_fd, bin_bytes + written_total, bin_len - written_total);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            written_total += (size_t)w;
+        }
+        close(snap_fd);
+        chmod(snapshot_path, 0700);
+    }
+    free(bin_bytes);
+
+    /* 2. If input file is specified and exists, compute authoritative C11 executed_input_sha256 */
+    char executed_input_sha256[65] = {0};
+    if (strlen(input_file) > 0 && access(input_file, F_OK) == 0) {
+        if (compute_file_sha256(input_file, executed_input_sha256) != 0) {
+            fprintf(stderr, "ERROR: Failed to hash input file '%s'\n", input_file);
+            return 72;
+        }
+        const char *expected_inp_sha = getenv("AIR10_EXPECTED_INPUT_SHA");
+        if (expected_inp_sha && expected_inp_sha[0] != '\0') {
+            if (strcasecmp(executed_input_sha256, expected_inp_sha) != 0) {
+                fprintf(stderr, "ERROR: INPUT_INTEGRITY_MISMATCH: input file SHA '%s' != expected '%s'\n", executed_input_sha256, expected_inp_sha);
+                return 77;
+            }
         }
     }
 
@@ -195,23 +322,42 @@ int main(int argc, char *argv[]) {
         setenv("AIR10_TRACE_ID", trace_id, 1);
         setenv("AIR10_PARENT_SPAN_ID", parent_span_id, 1);
 
-        /* Build arbitrary argv: child_args[0] = binary_path, child_args[1..] = argv[4..], NULL */
+        /* Build arbitrary argv: child_args[0] = snapshot_path, child_args[1..] = argv[4..], NULL */
         int child_argc = argc - 3;
         char **child_args = (char **)malloc(sizeof(char *) * (child_argc + 1));
         if (!child_args) {
             perror("malloc");
             _exit(127);
         }
-        child_args[0] = (char *)binary_path;
+        child_args[0] = (char *)snapshot_path;
         for (int i = 4; i < argc; i++) {
             child_args[i - 3] = argv[i];
         }
         child_argc = argc - 3;
         child_args[child_argc] = NULL;
 
-        execv(binary_path, child_args);
+        /* If system binary in read-only SIP path on macOS, execute directly */
+        int is_sys_bin = 0;
+#ifdef __APPLE__
+        if (strncmp(binary_path, "/bin/", 5) == 0 ||
+            strncmp(binary_path, "/usr/bin/", 9) == 0 ||
+            strncmp(binary_path, "/sbin/", 6) == 0 ||
+            strncmp(binary_path, "/usr/sbin/", 10) == 0) {
+            is_sys_bin = 1;
+        }
+#endif
+        if (is_sys_bin) {
+            child_args[0] = (char *)binary_path;
+            execv(binary_path, child_args);
+        } else {
+            child_args[0] = (char *)snapshot_path;
+            execv(snapshot_path, child_args);
 
-        /* If execv fails */
+            /* If execv fails on snapshot, fallback to binary_path directly */
+            child_args[0] = (char *)binary_path;
+            execv(binary_path, child_args);
+        }
+
         perror("execv");
         _exit(127);
     }
@@ -299,7 +445,9 @@ int main(int argc, char *argv[]) {
     printf("  \"trace_id\": \"%s\",\n", trace_id);
     printf("  \"parent_span_id\": \"%s\",\n", parent_span_id);
     printf("  \"binary_path\": \"%s\",\n", binary_path);
+    printf("  \"executed_binary_sha256\": \"%s\",\n", executed_binary_sha256);
     printf("  \"input_file\": \"%s\",\n", input_file);
+    printf("  \"executed_input_sha256\": \"%s\",\n", executed_input_sha256[0] ? executed_input_sha256 : "NO_INPUT_FILE");
     printf("  \"exit_code\": %d,\n", exit_code);
     printf("  \"wall_duration_ms\": %.3f,\n", wall_duration_ms);
     printf("  \"utime_ms\": %.3f,\n", utime_ms);

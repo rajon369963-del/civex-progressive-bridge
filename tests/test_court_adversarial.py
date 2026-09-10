@@ -26,7 +26,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 import pytest
 from civex.bridge import ProgressiveToolBridge
@@ -68,7 +67,7 @@ def hermetic_audit_db(tmp_path):
         binary_path TEXT NOT NULL,
         binary_sha256 TEXT,
         input_path TEXT NOT NULL,
-        input_sha256 TEXT NOT NULL,
+        input_sha256 TEXT,
         stdout_sha256 TEXT,
         actual_exit_code INTEGER NOT NULL,
         duration_ms REAL NOT NULL,
@@ -1097,16 +1096,19 @@ def test_gate20_autonomous_self_healing_closed_loop(hermetic_audit_db, tmp_path,
 def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monkeypatch):
     """Gate 21: Full 5-Layer DAG Reality Test with SHA-256 Chain Validation.
     Validates complete 5-layer pipeline:
-    Layer 1 (INTENT) -> Layer 2 (ROUTER) -> Layer 3 (HYDRATION) -> Layer 4 (C11 EXEC) -> Layer 5 (VERIFIER).
-    Asserts strict causal parent-child span DAG linkages, payload hashes, and ledger persistence.
+    Layer 1 (INTENT) -> Layer 2 (ROUTER) -> Layer 3 (SHIM) -> Layer 4 (C11 EXEC) -> Layer 5 (VERIFIER).
+    Asserts strict causal parent-child span DAG linkages, payload hashes, and cross-trace readback verification.
     """
-    from civex.bridge import inspect_tool_metadata
     from civex.trace_plumbing import (
+        air10_cross_trace_readback,
+        air10_layer1_intent,
         air10_layer2_router,
+        air10_layer3_shim,
         air10_layer4_executor,
         air10_layer5_verifier,
     )
 
+    monkeypatch.setattr(air10_layer1_intent, "DB_PATH", hermetic_audit_db)
     monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
     monkeypatch.setattr(air10_layer4_executor, "DB_PATH", hermetic_audit_db)
     monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
@@ -1125,6 +1127,7 @@ def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monke
     input_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
 
     output_file = str(tmp_path / "dag_output.json")
+    shim_log_path = str(tmp_path / "shim_intercept.log")
 
     # Seed contract and baseline trace
     conn = sqlite3.connect(hermetic_audit_db)
@@ -1146,25 +1149,13 @@ def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monke
     conn.commit()
     conn.close()
 
-    trace_id = "tr_gate21_full_dag"
-
     # Layer 1: INTENT
-    span_intent_id = "span_intent_g21"
-    intent_payload = {
-        "intent": "parse strict single doc json with full DAG reality",
-        "required_capability": "JSON_SINGLE_DOC_STRICT",
-        "input_format": "SINGLE_DOC_STRICT_RFC8259"
-    }
-    intent_payload_sha = hashlib.sha256(json.dumps(intent_payload, sort_keys=True).encode("utf-8")).hexdigest()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(hermetic_audit_db)
-    conn.execute("""
-        INSERT INTO trace_events
-        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
-        VALUES (?, ?, NULL, 'INTENT', 'civex_intent_orchestrator', ?, ?, 'COMPLETED', ?)
-    """, (trace_id, span_intent_id, now_iso, intent_payload_sha, json.dumps(intent_payload)))
-    conn.commit()
-    conn.close()
+    trace_id, span_intent_id = air10_layer1_intent.emit_intent(
+        intent_name="CANONICAL_JSON_PARSE_RFC8259",
+        description="parse strict single doc json with full DAG reality",
+        caller="civex_intent_orchestrator",
+        db_path=hermetic_audit_db
+    )
 
     # Layer 2: ROUTER
     candidate_pool = [{"name": "dag_worker", "binary": dag_bin}]
@@ -1173,36 +1164,32 @@ def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monke
         parent_span_id=span_intent_id,
         intent_query="parse strict single doc json",
         required_capability="JSON_SINGLE_DOC_STRICT",
-        candidates_override=candidate_pool
+        candidates_override=candidate_pool,
+        db_path=hermetic_audit_db
     )
     assert chosen_tool == "dag_worker"
     assert chosen_bin == dag_bin
 
-    # Layer 3: HYDRATION (Tool Hydration with safe metadata inspection)
-    span_hydr_id = "span_hydr_g21"
-    hydr_payload = {
-        "tool_id": chosen_tool,
-        "metadata": inspect_tool_metadata(chosen_tool),
-        "hydrated_executable": chosen_bin
-    }
-    hydr_sha = hashlib.sha256(json.dumps(hydr_payload, sort_keys=True).encode("utf-8")).hexdigest()
-    conn = sqlite3.connect(hermetic_audit_db)
-    conn.execute("""
-        INSERT INTO trace_events
-        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
-        VALUES (?, ?, ?, 'TOOL_HYDRATION', 'civex_hydration_engine', ?, ?, 'COMPLETED', ?)
-    """, (trace_id, span_hydr_id, span_router_id, now_iso, hydr_sha, json.dumps(hydr_payload)))
-    conn.commit()
-    conn.close()
+    # Layer 3: SHIM INTERCEPT
+    span_shim_id = air10_layer3_shim.shim_intercept(
+        trace_id=trace_id,
+        tool_name=chosen_tool,
+        binary_path=chosen_bin,
+        command_args=[input_file],
+        parent_span_id=span_router_id,
+        db_path=hermetic_audit_db,
+        shim_log=shim_log_path
+    )
 
     # Layer 4: PROCESS_EXECUTION (C11 supervised execution)
     rc, dur_ms, out_sha = air10_layer4_executor.execute_process(
         trace_id=trace_id,
         binary_path=chosen_bin,
         input_file=input_file,
-        parent_span_id=span_hydr_id,
+        parent_span_id=span_shim_id,
         output_file=output_file,
-        argv=[input_file]
+        argv=[input_file],
+        db_path=hermetic_audit_db
     )
     assert rc == 0
 
@@ -1214,56 +1201,31 @@ def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monke
     )
     assert verdict == "VERIFIED_PASS"
 
-    # Assert Complete 5-Layer DAG Structure & Causal Links
-    conn = sqlite3.connect(hermetic_audit_db)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM trace_events WHERE trace_id = ? ORDER BY event_id ASC", (trace_id,))
-    events = cur.fetchall()
-    conn.close()
-
-    assert len(events) == 5, f"Expected 5 spans in DAG, got {len(events)}"
-    stages = [e["stage"] for e in events]
-    assert stages == ["INTENT", "ROUTER_EVALUATION", "TOOL_HYDRATION", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"]
-
-    # Verify causal parent-child pointers
-    assert events[0]["parent_span_id"] is None
-    assert events[1]["parent_span_id"] == events[0]["span_id"]
-    assert events[2]["parent_span_id"] == events[1]["span_id"]
-    assert events[3]["parent_span_id"] == events[2]["span_id"]
-    assert events[4]["parent_span_id"] == events[3]["span_id"]
-
-    # Verify all payload SHA-256 are valid 64-char hex strings
-    hex_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
-    for e in events:
-        assert hex_pattern.match(e["payload_sha256"])
-
-    # Verify tool_traces_v2 record
-    conn = sqlite3.connect(hermetic_audit_db)
-    conn.row_factory = sqlite3.Row
-    t_row = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (trace_id,)).fetchone()
-    conn.close()
-    assert t_row is not None
-    assert t_row["chosen_tool"] == "dag_worker"
-    assert t_row["verification_status"] == "VERIFIED_PASS"
-    assert t_row["semantic_equivalence"] == "EXACT_AST_MATCH"
-    assert t_row["binary_sha256"] == dag_bin_sha
-    assert t_row["stdout_sha256"] == out_sha
+    # Strict Validation via air10_cross_trace_readback:
+    # Mathematical causal DAG validation, DFS acyclicity, 1 root, 0 orphans,
+    # exact stage order, shim log correlation, and all payload SHA-256 recomputed.
+    assert air10_cross_trace_readback.validate_and_readback(
+        trace_id=trace_id,
+        db_path=hermetic_audit_db,
+        shim_log=shim_log_path
+    ) is True
 
 
-def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, monkeypatch):
-    """Gate 22: Attestation Binding & Anti-ABA Reality Test.
-    1. Missing execution digest fails closed without disk backfill; recorded as SQL NULL in ledger.
+def test_gate22_post_exec_tampering_and_attestation_binding(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 22: Post-Execution Tampering & Attestation Binding Reality Test.
+    1. Missing execution digest (stdout_sha256 or input_sha256) fails closed without disk backfill;
+       recorded as SQL NULL in tool_traces_v2 ledger with MISSING_EXECUTION_ATTESTATION.
     2. Post-execution binary mutation (Anti-ABA attack) fails closed with BINARY_INTEGRITY_VIOLATION.
     3. CourtAwareRanker supervision check: rejects candidates without C11 supervisor.
     """
+    from civex.bridge import CIVeXVerifier
     from civex.court_ranking import CourtAwareRanker
     from civex.trace_plumbing import air10_layer5_verifier
 
     monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
     monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
 
-    # 1. Missing execution digest fails closed without disk backfill, stores NULL in tool_traces_v2
+    # 1A. Missing stdout execution digest fails closed, stores NULL in tool_traces_v2
     input_file = str(tmp_path / "g22_input.json")
     with open(input_file, "w", encoding="utf-8") as f:
         f.write('{"key": "value"}')
@@ -1276,13 +1238,13 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
     test_bin_sha = hashlib.sha256(open(test_bin, "rb").read()).hexdigest()
 
     # Trace with missing stdout_sha256
-    t_id_missing = "tr_gate22_missing_attest"
+    t_id_missing_out = "tr_gate22_missing_stdout_attest"
     conn = sqlite3.connect(hermetic_audit_db)
     conn.execute("""
-        INSERT INTO trace_events
+        INSERT INTO trace_events 
         (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
         VALUES (?, 'span_exec_g22_m', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
-    """, (t_id_missing, json.dumps({
+    """, (t_id_missing_out, json.dumps({
         "binary_path": test_bin,
         "binary_sha256": test_bin_sha,
         "input_file": input_file,
@@ -1294,16 +1256,46 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
     conn.commit()
     conn.close()
 
-    verdict_m = air10_layer5_verifier.verify_trace(t_id_missing, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    verdict_m = air10_layer5_verifier.verify_trace(t_id_missing_out, target_stdout_file=None, audit_db_path=hermetic_audit_db)
     assert verdict_m == "VERIFIED_FAIL_INVARIANT_VIOLATION"
 
     conn = sqlite3.connect(hermetic_audit_db)
     conn.row_factory = sqlite3.Row
-    row_m = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (t_id_missing,)).fetchone()
+    row_m = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (t_id_missing_out,)).fetchone()
     conn.close()
     assert row_m is not None
-    assert row_m["stdout_sha256"] is None, "Missing digest must be stored as SQL NULL"
+    assert row_m["stdout_sha256"] is None, "Missing stdout digest must be stored as SQL NULL"
     assert row_m["semantic_equivalence"] == "MISSING_EXECUTION_ATTESTATION"
+
+    # 1B. Missing input execution digest fails closed, stores NULL in tool_traces_v2
+    t_id_missing_in = "tr_gate22_missing_input_attest"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events 
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g22_in', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (t_id_missing_in, json.dumps({
+        "binary_path": test_bin,
+        "binary_sha256": test_bin_sha,
+        "input_file": input_file,
+        # input_sha256 omitted
+        "actual_returncode": 0,
+        "duration_ms": 1.0,
+        "stdout_sha256": hashlib.sha256(b'{"key": "value"}').hexdigest()
+    })))
+    conn.commit()
+    conn.close()
+
+    verdict_in = air10_layer5_verifier.verify_trace(t_id_missing_in, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    assert verdict_in == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    row_in = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (t_id_missing_in,)).fetchone()
+    conn.close()
+    assert row_in is not None
+    assert row_in["input_sha256"] is None, "Missing input digest must be stored as SQL NULL"
+    assert row_in["semantic_equivalence"] == "MISSING_EXECUTION_ATTESTATION"
 
     # 2. Anti-ABA: Post-execution binary mutation detected fail-closed
     t_id_aba = "tr_gate22_anti_aba"
@@ -1316,7 +1308,7 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
 
     conn = sqlite3.connect(hermetic_audit_db)
     conn.execute("""
-        INSERT INTO trace_events
+        INSERT INTO trace_events 
         (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
         VALUES (?, 'span_exec_g22_aba', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
     """, (t_id_aba, json.dumps({
@@ -1347,7 +1339,6 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
     assert "does not match disk binary SHA" in aba_details["failure_reason"]
 
     # 3. CourtAwareRanker C11 Supervisor Enforcement
-    # Candidate with unverified supervisor (e.g. producer='python_unsafe') must fail supervision check
     unsup_bin = str(tmp_path / "unsup_tool.sh")
     with open(unsup_bin, "w", encoding="utf-8") as f:
         f.write("#!/bin/sh\nexit 0\n")
@@ -1373,7 +1364,6 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
     conn.commit()
     conn.close()
 
-    from civex.bridge import CIVeXVerifier
     ranker = CourtAwareRanker(audit_db_path=hermetic_audit_db, verifier=CIVeXVerifier())
     score = ranker.score_tool(
         tool_name="unsupervised_tool",
@@ -1383,5 +1373,212 @@ def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, mo
     assert score.status == "SUPERVISION_UNVERIFIED_HOLD"
     assert score.final_score == 0.0
     assert "No C11 supervised process execution trace" in score.rationale
+
+
+def test_gate23_master_closed_loop_and_true_aba(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 23: Master Closed Loop, Same-Request Self-Healing & True ABA Resistance.
+    1. Same-Request Self-Healing: Single-invocation failover when primary tool fails verification.
+    2. C11 Supervisor Unavailable: Zero child process execution and fail-closed refusal.
+    3. Missing Input Attestation: Fail-closed with SQL NULL in tool_traces_v2 ledger.
+    4. True ABA Resistance: Execution of immutable content-addressed snapshots & pre-exec binary SHA verification.
+    """
+    from civex.bridge import CIVeXVerifier
+    from civex.trace_plumbing import (
+        air10_layer2_router,
+        air10_layer4_executor,
+        air10_layer5_verifier,
+    )
+
+    monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer4_executor, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    cb_state_file = str(tmp_path / "gate23_cb_state.json")
+    monkeypatch.setattr(CIVeXVerifier, "STATE_FILE", cb_state_file)
+
+    # 1. Same-Request Self-Healing (Single Invocation Failover)
+    primary_bin = str(tmp_path / "primary_tool.sh")
+    with open(primary_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(primary_bin, 0o755)
+    primary_sha = hashlib.sha256(open(primary_bin, "rb").read()).hexdigest()
+
+    fallback_bin = str(tmp_path / "fallback_tool.sh")
+    with open(fallback_bin, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nfor arg do last="$arg"; done\ncat "$last"\nexit 0\n')
+    os.chmod(fallback_bin, 0o755)
+    fallback_sha = hashlib.sha256(open(fallback_bin, "rb").read()).hexdigest()
+
+    input_file = str(tmp_path / "g23_input.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"test": "gate23_master"}')
+    in_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('primary_tool', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'APPROVED_PRIMARY', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (primary_bin, primary_sha))
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('fallback_tool', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'APPROVED_FALLBACK', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (fallback_bin, fallback_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_p', 'JSON_PARSE', 'BATCH', '[]', 'primary_tool', ?, ?, ?, ?, ?, 0, 0.1, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (primary_bin, primary_sha, input_file, in_sha, primary_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_p', 'span_seed_p', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "primary_tool", "binary_path": primary_bin}),))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_fb', 'JSON_PARSE', 'BATCH', '[]', 'fallback_tool', ?, ?, ?, ?, ?, 0, 1.5, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (fallback_bin, fallback_sha, input_file, in_sha, fallback_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_fb', 'span_seed_fb', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "fallback_tool", "binary_path": fallback_bin}),))
+    conn.commit()
+    conn.close()
+
+    candidate_pool = [
+        {"name": "primary_tool", "binary": primary_bin},
+        {"name": "fallback_tool", "binary": fallback_bin}
+    ]
+
+    # Trip primary_tool in circuit breaker to demonstrate same-request fallback
+    verifier = CIVeXVerifier()
+    verifier.record_outcome("primary_tool", success=False, error_msg="Primary execution failure")
+    verifier.record_outcome("primary_tool", success=False, error_msg="Primary execution failure")
+    verifier.record_outcome("primary_tool", success=False, error_msg="Primary execution failure")
+    assert verifier.is_circuit_open("primary_tool")
+
+    trace_id_heal = "tr_gate23_same_req_heal"
+    chosen_tool, chosen_bin, span_router = air10_layer2_router.route_intent(
+        trace_id=trace_id_heal,
+        parent_span_id="span_root_g23",
+        intent_query="parse strict single doc json",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=candidate_pool,
+        db_path=hermetic_audit_db
+    )
+    assert chosen_tool == "fallback_tool", f"Expected immediate fallback to fallback_tool, got {chosen_tool}"
+    assert chosen_bin == fallback_bin
+
+    out_fb = str(tmp_path / "out_fb.json")
+    rc_fb, _, out_sha_fb = air10_layer4_executor.execute_process(
+        trace_id=trace_id_heal,
+        binary_path=chosen_bin,
+        input_file=input_file,
+        parent_span_id=span_router,
+        output_file=out_fb,
+        argv=[input_file],
+        db_path=hermetic_audit_db
+    )
+    assert rc_fb == 0
+    verdict_fb = air10_layer5_verifier.verify_trace(trace_id_heal, target_stdout_file=out_fb, audit_db_path=hermetic_audit_db)
+    assert verdict_fb == "VERIFIED_PASS"
+
+    # 2. C11 Supervisor Unavailable: Zero Child Execution & Fail-Closed Refusal
+    non_existent_boundary = str(tmp_path / "nonexistent_air10_boundary")
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", non_existent_boundary)
+
+    marker_file = str(tmp_path / "should_never_be_created.txt")
+    marker_script = str(tmp_path / "marker_script.sh")
+    with open(marker_script, "w", encoding="utf-8") as f:
+        f.write(f"#!/bin/sh\ntouch {marker_file}\nexit 0\n")
+    os.chmod(marker_script, 0o755)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_gate23_no_sup",
+            binary_path=marker_script,
+            input_file=input_file,
+            db_path=hermetic_audit_db
+        )
+    assert "EXECUTION_SUPERVISOR_UNAVAILABLE_HOLD" in str(excinfo.value)
+    # Assert child process NEVER executed: marker file does not exist
+    assert not os.path.exists(marker_file), "Child process executed despite missing supervisor!"
+
+    # Restore real boundary binary
+    real_boundary = "/tmp/air10_exec_boundary"
+    if not os.path.isfile(real_boundary):
+        real_boundary = "/Users/rajondas/.local/bin/air10_exec_boundary"
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", real_boundary)
+
+    # 3. Missing Input Attestation -> Fail-Closed & NULL Ledger Proof
+    t_id_missing_inp = "tr_gate23_missing_input_attest"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events 
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g23_mi', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (t_id_missing_inp, json.dumps({
+        "binary_path": fallback_bin,
+        "binary_sha256": fallback_sha,
+        "input_file": input_file,
+        # input_sha256 omitted
+        "actual_returncode": 0,
+        "duration_ms": 1.0,
+        "stdout_sha256": out_sha_fb
+    })))
+    conn.commit()
+    conn.close()
+
+    v_missing_inp = air10_layer5_verifier.verify_trace(t_id_missing_inp, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    assert v_missing_inp == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    row_mi = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (t_id_missing_inp,)).fetchone()
+    conn.close()
+    assert row_mi is not None
+    assert row_mi["input_sha256"] is None, "Missing input attestation must store SQL NULL in ledger"
+    assert row_mi["semantic_equivalence"] == "MISSING_EXECUTION_ATTESTATION"
+
+    # 4. True ABA Resistance: Execution of Immutable Snapshot & Pre-Exec Verification
+    aba_worker = str(tmp_path / "aba_worker.sh")
+    with open(aba_worker, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'GENUINE_ABA_PROTECTED_OUTPUT'\nexit 0\n")
+    os.chmod(aba_worker, 0o755)
+    worker_orig_sha = hashlib.sha256(open(aba_worker, "rb").read()).hexdigest()
+
+    # Sub-check A: Pre-exec binary SHA mismatch fails closed with exit code 76 before fork/exec
+    c11_bin = os.environ.get("AIR10_EXEC_BOUNDARY", "/tmp/air10_exec_boundary")
+    if not os.path.isfile(c11_bin):
+        c11_bin = "/Users/rajondas/.local/bin/air10_exec_boundary"
+
+    env_mismatch = os.environ.copy()
+    env_mismatch["AIR10_EXPECTED_BINARY_SHA"] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    proc_mismatch = subprocess.run(
+        [c11_bin, "tr_gate23_mismatch", "span_root", aba_worker, input_file],
+        capture_output=True, text=True, env=env_mismatch
+    )
+    assert proc_mismatch.returncode == 76, f"Expected fail-closed exit 76 on SHA mismatch, got {proc_mismatch.returncode}"
+
+    # Sub-check B: Content-addressed immutable snapshot execution
+    env_valid = os.environ.copy()
+    env_valid["AIR10_EXPECTED_BINARY_SHA"] = worker_orig_sha
+    proc_valid = subprocess.run(
+        [c11_bin, "tr_gate23_valid_snap", "span_root", aba_worker, input_file],
+        capture_output=True, text=True, env=env_valid
+    )
+    assert proc_valid.returncode == 0
+    snap_data = json.loads(proc_valid.stdout)
+    assert snap_data["executed_binary_sha256"] == worker_orig_sha
+    expected_out_sha = hashlib.sha256(b"GENUINE_ABA_PROTECTED_OUTPUT").hexdigest()
+    assert snap_data["stdout_sha256"] == expected_out_sha
+    # Check that snapshot file exists
+    snapshot_file = f"/tmp/air10_exec_snapshots/{worker_orig_sha}"
+    assert os.path.isfile(snapshot_file), f"Expected immutable snapshot at {snapshot_file}"
+
 
 

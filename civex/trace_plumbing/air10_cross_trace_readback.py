@@ -12,7 +12,12 @@ Enforces 7 Invariants (Zero Warnings, Zero Assert statements, Strict Exit 1 on A
 7. Exact field-for-field disk correlation with shim_intercept.log
 8. Durable presence of tool_traces_v2 summary record
 """
-import sys, os, sqlite3, json, re
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
 
 DB_PATH = "/Users/rajondas/.antigravity/air10_audit.db"
 SHIM_LOG = "/Users/rajondas/.antigravity/shim_intercept.log"
@@ -163,7 +168,7 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     if os.path.isfile(active_shim):
         with open(active_shim, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if trace_id in line and "SHIM:air10-exec-boundary" in line:
+                if trace_id in line and "SHIM:" in line:
                     shim_log_found = True
                     m = re.search(r"PID:(\d+)\s+TRACE:(\S+)\s+SPAN:(\S+)\s+PARENT:(\S+)\s+SHIM:(\S+)\s+BIN:(\S+)", line)
                     if m:
@@ -179,7 +184,7 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
                     break
 
     if not shim_log_found or not shim_line_parsed:
-        fatal_violation(f"No structured air10-exec-boundary line found in {active_shim} for trace {trace_id}!")
+        fatal_violation(f"No structured SHIM line found in {active_shim} for trace {trace_id}!")
 
     shim_ev = event_by_stage["SHIM_INTERCEPT"]
     router_ev = event_by_stage["ROUTER_EVALUATION"]
@@ -188,7 +193,7 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     db_router_span = router_ev[1]
     db_shim_details = json.loads(shim_ev[8])
     db_parent_pid = db_shim_details.get("parent_pid")
-    db_target_bin = db_shim_details.get("target_bin")
+    db_target_bin = db_shim_details.get("target_bin") or db_shim_details.get("binary_path")
 
     # Strict explicit comparisons (NO assert statements!)
     if shim_line_parsed["trace_id"] != trace_id:
@@ -202,7 +207,16 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     if shim_line_parsed["pid"] != db_parent_pid:
         fatal_violation(f"Shim log PID '{shim_line_parsed['pid']}' != DB '{db_parent_pid}'")
 
-    print(f"  [7] SHIM_LOG_EXACT_FIELD_CORRELATION      : ✅ PASS (Span, Parent, Bin, PID field-for-field verified)")
+    print("  [7] SHIM_LOG_EXACT_FIELD_CORRELATION      : ✅ PASS (Span, Parent, Bin, PID field-for-field verified)")
+
+    # Invariant 9: Recompute and verify payload_sha256 for all trace events
+    for ev in events:
+        eid, sid, parent_sid, stage, prod, ts, p_sha, status, details_str = ev
+        parsed_det = json.loads(details_str)
+        recomputed_sha = hashlib.sha256(json.dumps(parsed_det, sort_keys=True).encode("utf-8")).hexdigest()
+        if p_sha != recomputed_sha:
+            fatal_violation(f"PAYLOAD_SHA_MISMATCH at event {eid} ({stage}): recorded {p_sha} != recomputed {recomputed_sha}")
+    print("  [8] ALL_PAYLOAD_SHA256_RECOMPUTED_AND_VERIFIED : ✅ PASS (Every span payload cryptographically validated)")
 
     print("\n[VERIFIED CAUSAL SPAN GRAPH]")
     print(f"{'Event':<6} | {'Stage':<24} | {'Producer':<22} | {'ParentSpan':<24} -> {'SpanID'}")
@@ -215,7 +229,7 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
             extra = f" [ChildPID: {det.get('actual_child_pid')} | Exit: {det.get('actual_returncode')}]"
         elif stage == "INDEPENDENT_VERIFICATION":
             extra = f" [{status}: {det.get('semantic_result')}]"
-        print(f"{eid:<6} | {stage:<24} | {prod:<22} | {str(parent_sid):<24} -> {sid}{extra}")
+        print(f"{eid:<6} | {stage:<24} | {prod:<22} | {parent_sid!s:<24} -> {sid}{extra}")
 
     print("\n[DISK SHIM LINE PROOF]")
     print(f"  {shim_line_parsed['raw']}")

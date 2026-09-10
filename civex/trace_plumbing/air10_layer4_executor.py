@@ -17,7 +17,7 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
 
-def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None, output_file=None, argv=None):
+def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None, output_file=None, argv=None, db_path=None):
     span_id = f"span_exec_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
@@ -47,48 +47,42 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
     elif input_file:
         cmd_args = [input_file]
 
-    # 3. Supervised Execution (Prefer native C11 exec boundary)
+    # 3. Supervised Execution (MANDATORY C11 Execution Boundary Supervisor - Zero Python Fallback)
+    supervisor_bin = os.environ.get("AIR10_EXEC_BOUNDARY", SUPERVISOR_BIN)
+    if not (os.path.isfile(supervisor_bin) and os.access(supervisor_bin, os.X_OK)):
+        err_msg = f"EXECUTION_SUPERVISOR_UNAVAILABLE_HOLD: Mandatory C11 execution supervisor '{supervisor_bin}' missing or not executable. Unsupervised Python fallback strictly refused (fail-closed)."
+        sys.stderr.write(f"{err_msg}\n")
+        raise RuntimeError(err_msg)
+
     env = os.environ.copy()
     env["AIR10_TRACE_ID"] = trace_id
     env["AIR10_STDOUT_CAPTURE_PATH"] = output_file
+    if input_file:
+        env["AIR10_INPUT_FILE"] = input_file
     if effective_parent:
         env["AIR10_PARENT_SPAN_ID"] = effective_parent
 
-    if os.path.isfile(SUPERVISOR_BIN) and os.access(SUPERVISOR_BIN, os.X_OK):
-        proc = subprocess.run(
-            [SUPERVISOR_BIN, trace_id, effective_parent or "root", binary_path] + cmd_args,
-            capture_output=True, text=True, env=env
-        )
-        try:
-            boundary_data = json.loads(proc.stdout)
-            actual_returncode = boundary_data["exit_code"]
-            duration_ms = boundary_data["wall_duration_ms"]
-            duration_us = duration_ms * 1000.0
-            stdout_sha256 = boundary_data["stdout_sha256"]
-            supervisor_name = boundary_data.get("supervisor", "air10_exec_boundary_c11")
-        except Exception as e:
-            sys.stderr.write(f"C11_BOUNDARY_PARSE_ERROR: Failed to parse boundary json from stdout: {e}. Output: {proc.stdout[:200]}\n")
-            raise RuntimeError(f"FAIL-CLOSED: C11 supervisor boundary output parse error: {e}") from e
-        stdout_preview = proc.stdout[:200]
-        stderr_preview = proc.stderr[:200]
-    else:
-        # High-resolution clock python fallback
-        t_start = time.perf_counter_ns()
-        p = subprocess.run([binary_path] + cmd_args, capture_output=True, env=env)
-        t_end = time.perf_counter_ns()
+    proc = subprocess.run(
+        [supervisor_bin, trace_id, effective_parent or "root", binary_path] + cmd_args,
+        capture_output=True, text=True, env=env
+    )
+    try:
+        boundary_data = json.loads(proc.stdout)
+        actual_returncode = boundary_data["exit_code"]
+        duration_ms = boundary_data["wall_duration_ms"]
+        duration_us = duration_ms * 1000.0
+        stdout_sha256 = boundary_data["stdout_sha256"]
+        supervisor_name = boundary_data.get("supervisor", "air10_exec_boundary_c11")
+        executed_binary_sha256 = boundary_data.get("executed_binary_sha256", bin_sha256)
+        executed_input_sha256 = boundary_data.get("executed_input_sha256")
+        if not executed_input_sha256 or executed_input_sha256 == "NO_INPUT_FILE":
+            executed_input_sha256 = input_sha256
+    except Exception as e:
+        sys.stderr.write(f"C11_BOUNDARY_PARSE_ERROR: Failed to parse boundary json from stdout: {e}. Output: {proc.stdout[:200]}\n")
+        raise RuntimeError(f"FAIL-CLOSED: C11 supervisor boundary output parse error: {e}") from e
 
-        duration_us = (t_end - t_start) / 1_000.0
-        duration_ms = duration_us / 1_000.0
-        actual_returncode = p.returncode
-
-        stdout_raw = p.stdout
-        stderr_raw = p.stderr
-        with open(output_file, "wb") as of:
-            of.write(stdout_raw)
-        stdout_sha256 = hashlib.sha256(stdout_raw).hexdigest()
-        stdout_preview = stdout_raw.decode("utf-8", errors="replace")[:200]
-        stderr_preview = stderr_raw.decode("utf-8", errors="replace")[:200]
-        supervisor_name = "python_process_runner"
+    stdout_preview = proc.stdout[:200]
+    stderr_preview = proc.stderr[:200]
 
     # Strict Output Capture Parity Verification (Fail-Closed)
     if output_file:
@@ -102,10 +96,10 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
 
     details = {
         "binary_path": binary_path,
-        "binary_sha256": bin_sha256,
+        "binary_sha256": executed_binary_sha256,
         "input_file": input_file,
         "input_size_bytes": input_size,
-        "input_sha256": input_sha256,
+        "input_sha256": executed_input_sha256,
         "output_file": output_file,
         "actual_returncode": actual_returncode,
         "duration_us": duration_us,
@@ -119,8 +113,9 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
     payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
 
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
+    active_db = db_path or DB_PATH
+    if os.path.exists(active_db):
+        conn = sqlite3.connect(active_db)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trace_events 

@@ -243,6 +243,18 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
             semantic_result = "BINARY_INTEGRITY_VIOLATION"
             failure_reason = f"FAIL-CLOSED: binary_sha256 '{binary_sha256}' does not match disk binary SHA '{disk_bin_sha}'"
 
+    input_sha256 = exec_input_sha
+    if not input_sha256 or input_sha256 == ZERO_SENTINEL or input_sha256 == F_SENTINEL or not sha_hex_pattern.match(input_sha256):
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        if not semantic_result or semantic_result.startswith("ACCEPTANCE_ONLY") or semantic_result == "EXACT_AST_MATCH":
+            semantic_result = "MISSING_EXECUTION_ATTESTATION"
+        failure_reason = f"FAIL-CLOSED: exec_input_sha is missing, invalid hex, or synthetic sentinel: '{input_sha256}'"
+        input_sha256 = None
+    elif input_sha256 != current_input_sha256:
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        semantic_result = "TOCTOU_INTEGRITY_VIOLATION"
+        failure_reason = f"TOCTOU_MUTATION_DETECTED: input file SHA {current_input_sha256} does not match executed SHA {input_sha256}"
+
     stdout_sha256 = exec_stdout_sha
     if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or stdout_sha256 == F_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
         verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
@@ -251,7 +263,7 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         failure_reason = f"FAIL-CLOSED: exec_stdout_sha is missing, invalid hex, or synthetic sentinel: '{stdout_sha256}'"
         stdout_sha256 = None
 
-    if verdict_status != "VERIFIED_PASS" and (binary_sha256 is None or stdout_sha256 is None):
+    if verdict_status != "VERIFIED_PASS" and (binary_sha256 is None or stdout_sha256 is None or input_sha256 is None):
         if not semantic_result or semantic_result.startswith("ACCEPTANCE_ONLY") or semantic_result == "EXACT_AST_MATCH":
             semantic_result = "MISSING_EXECUTION_ATTESTATION"
 
@@ -263,7 +275,7 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         "semantic_result": semantic_result,
         "failure_reason": failure_reason,
         "input_file": input_file,
-        "input_sha256": current_input_sha256,
+        "input_sha256": input_sha256,
         "target_bin": target_bin,
         "actual_returncode": actual_returncode,
         "binary_sha256": binary_sha256,
@@ -293,7 +305,7 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         VALUES (?, ?, 'TASK_CLI_HOTPATH', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trace_id, task_intent, candidates_json, chosen_tool, target_bin,
-        binary_sha256, input_file, current_input_sha256, stdout_sha256, actual_returncode,
+        binary_sha256, input_file, input_sha256, stdout_sha256, actual_returncode,
         duration_ms, semantic_result, verdict_status, failure_reason, now_iso
     ))
 

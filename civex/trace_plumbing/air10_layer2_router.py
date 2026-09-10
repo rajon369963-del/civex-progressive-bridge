@@ -17,21 +17,22 @@ import uuid
 # Portable DB path
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 
-def route_intent(trace_id, parent_span_id, intent_query, required_capability="JSON_SINGLE_DOC_STRICT", input_format="SINGLE_DOC_STRICT_RFC8259", contract_version="v1.0", candidates_override=None):
+def route_intent(trace_id, parent_span_id, intent_query, required_capability="JSON_SINGLE_DOC_STRICT", input_format="SINGLE_DOC_STRICT_RFC8259", contract_version="v1.0", candidates_override=None, db_path=None):
     span_id = f"span_router_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    active_db = db_path or DB_PATH
 
     # CHAKKA JODO: Import and consume single authoritative CourtAwareRanker
     try:
         from civex.bridge import CIVeXVerifier
         from civex.court_ranking import CourtAwareRanker
         verifier = CIVeXVerifier()
-        ranker = CourtAwareRanker(audit_db_path=DB_PATH, verifier=verifier)
+        ranker = CourtAwareRanker(audit_db_path=active_db, verifier=verifier)
     except Exception:
         # Standalone plumbing fallback
         try:
             from court_ranking import CourtAwareRanker
-            ranker = CourtAwareRanker(audit_db_path=DB_PATH)
+            ranker = CourtAwareRanker(audit_db_path=active_db)
         except Exception:
             ranker = None
 
@@ -179,8 +180,8 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
 
     # 4. Insert ROUTER_EVALUATION span with explicit parent_span_id
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
+    if os.path.exists(active_db):
+        conn = sqlite3.connect(active_db)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trace_events 
