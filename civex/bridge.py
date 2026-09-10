@@ -2,7 +2,7 @@
 """
 CIVEX: PROGRESSIVE TOOL DISCLOSURE, HEADROOM COMPRESSION & CAUSAL VERIFIER
 ===========================================================================
-Sub-50µs adaptive tool retrieval and token-efficient dynamic schema hydration
+Sub-millisecond adaptive tool retrieval and token-efficient dynamic schema hydration
 for large-scale agentic tool catalogs (5,000+ tools).
 
 Core Architecture:
@@ -38,6 +38,11 @@ FIXTURE_CATALOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
 class HeadroomCompressor:
     """Compresses verbose JSON/log payloads by 60-95% before returning to LLM context."""
 
+    SIGNALS = (
+        "error", "exception", "failed", "failure", "critical",
+        "bug", "traceback", "false_green", "segfault", "panic", "fatal"
+    )
+
     def compress(self, data: Any, max_list_items: int = 3, max_str_len: int = 120) -> Any:
         if isinstance(data, str):
             try:
@@ -47,64 +52,87 @@ class HeadroomCompressor:
                 return self.compress_text(data)
         return self.compress_json(data, max_list_items, max_str_len)
 
-    @staticmethod
-    def _has_critical_signal(x: Any) -> bool:
-        signals = (
-            "error", "exception", "failed", "failure", "critical",
-            "bug", "traceback", "false_green", "segfault", "panic", "fatal"
-        )
+    @classmethod
+    def _has_critical_signal(cls, x: Any) -> bool:
         if isinstance(x, dict):
             for k, v in x.items():
                 k_str = str(k).lower()
                 v_str = str(v).lower()
-                if any(t in k_str or t in v_str for t in signals):
+                if any(t in k_str or t in v_str for t in cls.SIGNALS):
                     return True
-                if isinstance(v, (dict, list)) and HeadroomCompressor._has_critical_signal(v):
+                if isinstance(v, (dict, list)) and cls._has_critical_signal(v):
                     return True
         elif isinstance(x, str):
             low = x.lower()
-            if any(t in low for t in signals):
+            if any(t in low for t in cls.SIGNALS):
                 return True
         elif isinstance(x, (list, tuple)):
-            return any(HeadroomCompressor._has_critical_signal(item) for item in x)
+            return any(cls._has_critical_signal(item) for item in x)
         return False
 
-    @staticmethod
-    def compress_json(data: Any, max_list_items: int = 3, max_str_len: int = 120) -> Any:
+    @classmethod
+    def compress_json(cls, data: Any, max_list_items: int = 3, max_str_len: int = 120) -> Any:
         if isinstance(data, dict):
             compressed = {}
             for k, v in data.items():
                 if v is None or v == "" or v == []:
                     continue  # Strip nulls and empty lists
-                compressed[k] = HeadroomCompressor.compress_json(v, max_list_items, max_str_len)
+                compressed[k] = cls.compress_json(v, max_list_items, max_str_len)
             return compressed
         elif isinstance(data, list):
-            sampled = [HeadroomCompressor.compress_json(x, max_list_items, max_str_len) for x in data[:max_list_items]]
+            sampled = [cls.compress_json(x, max_list_items, max_str_len) for x in data[:max_list_items]]
             if len(data) > max_list_items:
                 critical_extras = [
-                    HeadroomCompressor.compress_json(x, max_list_items, max_str_len)
+                    cls.compress_json(x, max_list_items, max_str_len)
                     for x in data[max_list_items:]
-                    if HeadroomCompressor._has_critical_signal(x)
+                    if cls._has_critical_signal(x)
                 ]
                 sampled.append(f"... [omitted {len(data) - max_list_items - len(critical_extras)} nominal items] ...")
                 sampled.extend(critical_extras)
             return sampled
         elif isinstance(data, str):
             if len(data) > max_str_len:
-                if HeadroomCompressor._has_critical_signal(data):
-                    # Keep start, ellipsis, and preserved critical end
-                    return data[:max_str_len] + f"... [signal preserved: {len(data)} chars] ... " + data[-120:]
+                if cls._has_critical_signal(data):
+                    low = data.lower()
+                    best_pos = -1
+                    best_len = 0
+                    for sig in cls.SIGNALS:
+                        pos = low.find(sig)
+                        if pos != -1:
+                            if best_pos == -1 or pos < best_pos:
+                                best_pos = pos
+                                best_len = len(sig)
+
+                    if best_pos != -1:
+                        w_start = max(0, best_pos - 40)
+                        w_end = min(len(data), best_pos + best_len + 50)
+                        sig_window = data[w_start:w_end]
+
+                        head = data[:50] if w_start > 50 else ""
+                        tail = data[-50:] if w_end < len(data) - 50 else ""
+
+                        parts = []
+                        if head:
+                            parts.append(head)
+                        if w_start > len(head):
+                            parts.append(f"... [omitted {w_start - len(head)} chars] ...")
+                        parts.append(sig_window)
+                        if len(data) - len(tail) > w_end:
+                            parts.append(f"... [omitted {len(data) - len(tail) - w_end} chars] ...")
+                        if tail:
+                            parts.append(tail)
+                        return "".join(parts)
                 return data[:max_str_len] + f"... [truncated {len(data)-max_str_len} chars]"
             return data
         return data
 
-    @staticmethod
-    def compress_text(text: str) -> str:
+    @classmethod
+    def compress_text(cls, text: str) -> str:
         lines = text.split("\n")
         if len(lines) > 20:
             head = lines[:5]
             tail = lines[-5:]
-            critical = [line for line in lines[5:-5] if HeadroomCompressor._has_critical_signal(line)]
+            critical = [line for line in lines[5:-5] if cls._has_critical_signal(line)]
             return "\n".join(head + [f"... [omitted {len(lines)-10-len(critical)} lines of logs] ..."] + critical + tail)
         return text
 
@@ -118,7 +146,6 @@ class SchemaShrinker:
     @staticmethod
     def shrink_tool(row: tuple) -> dict[str, Any]:
         tool_id, name, category, bin_path, exec_tmpl, desc, intents, tags = row[:8]
-        # Clean description to 1 concise sentence
         clean_desc = (desc or "").split("\n")[0].strip()
         if len(clean_desc) > 90:
             clean_desc = clean_desc[:90] + "..."
@@ -130,7 +157,6 @@ class SchemaShrinker:
             "summary": clean_desc,
             "cmd": exec_tmpl or name
         }
-        # Never truncate executable commands: oversized commands require hydration.
         if len(json.dumps(shadow).encode("utf-8")) >= 250:
             shadow["cmd"] = None
         for field in ("summary", "name", "cat"):
@@ -169,6 +195,22 @@ class CIVeXVerifier:
                             state = json.load(f)
                     except Exception as e:
                         raise ValueError(f"Corrupt state file: {e}")
+
+                # Automatic legacy state migration
+                if isinstance(state, dict):
+                    if "failure_counts" not in state:
+                        # Migrate legacy flat dict: {tool_id: count}
+                        migrated_fc = {k: v for k, v in state.items() if isinstance(v, int)}
+                        state = {
+                            "failure_counts": migrated_fc,
+                            "execution_history": []
+                        }
+                    else:
+                        state.setdefault("failure_counts", {})
+                        state.setdefault("execution_history", [])
+                else:
+                    state = {"failure_counts": {}, "execution_history": []}
+
                 yield state
                 temp_path = self.STATE_FILE + f".tmp.{os.getpid()}_{time.time_ns()}"
                 with open(temp_path, "w", encoding="utf-8") as tf:
@@ -225,33 +267,52 @@ class CIVeXVerifier:
         return h.hexdigest()
 
     def verify_causal_write(self, target_path: str, pre_hash: str | None, exit_code: int) -> dict[str, Any]:
+        """Verifies physical disk state against exit code and cryptographic hashes."""
         post_hash = self.hash_file(target_path)
-        file_size = os.path.getsize(target_path) if os.path.exists(target_path) else 0
+        file_exists = os.path.exists(target_path)
+        file_size = os.path.getsize(target_path) if file_exists else 0
 
+        # REJECTION 1: Non-zero exit code
         if exit_code != 0:
             return {
                 "verdict": "NONZERO_EXIT",
                 "error": f"Command exited with code {exit_code}",
                 "pre_hash": pre_hash,
-                "post_hash": post_hash
+                "post_hash": post_hash,
+                "size_bytes": file_size
             }
 
+        # REJECTION 2: Target file does NOT exist on disk (phantom green / false positive)
+        if not file_exists:
+            return {
+                "verdict": "TARGET_MISSING",
+                "error": "Exit code 0 but target file does NOT exist on disk (phantom execution)",
+                "pre_hash": pre_hash,
+                "post_hash": None,
+                "size_bytes": 0
+            }
+
+        # REJECTION 3: Idempotent no-op execution (pre_hash == post_hash)
         if pre_hash == post_hash and pre_hash is not None:
             return {
                 "verdict": "FALSE_GREEN",
                 "error": "Exit code 0 but target file was NOT mutated (idempotent/noop execution)",
                 "pre_hash": pre_hash,
-                "post_hash": post_hash
+                "post_hash": post_hash,
+                "size_bytes": file_size
             }
 
-        if file_size == 0 and os.path.exists(target_path):
+        # REJECTION 4: Empty 0-byte file mutation
+        if file_size == 0:
             return {
                 "verdict": "0_BYTE_MUTATION",
                 "error": "Exit code 0 but target file is 0 bytes (corrupt or empty payload)",
                 "pre_hash": pre_hash,
-                "post_hash": post_hash
+                "post_hash": post_hash,
+                "size_bytes": 0
             }
 
+        # Genuine physical state mutation confirmed
         return {
             "verdict": "CONFIRMED",
             "pre_hash": pre_hash,
@@ -264,7 +325,7 @@ class CIVeXVerifier:
 # 4. PROGRESSIVE 2-TIER DISCOVERY ENGINE
 # ---------------------------------------------------------------------------
 class ProgressiveToolBridge:
-    """Sub-50µs Progressive Discovery Bridge over large-scale catalogs using SQLite FTS5 BM25."""
+    """Sub-millisecond Progressive Discovery Bridge over large-scale catalogs using SQLite FTS5 BM25."""
 
     def __init__(self, db_path: str | None = None):
         if db_path:
@@ -293,11 +354,9 @@ class ProgressiveToolBridge:
             return '""'
         safe = lambda t: t.replace('"', '').replace("'", '').replace('*', '').replace('^', '')
         parts = []
-        # Full phrase match (highest relevance)
         full = ' '.join(safe(t) for t in tokens)
         if full.strip():
             parts.append(f'"{full}"*')
-        # Individual token prefix matches
         for t in tokens[:6]:
             s = safe(t)
             if s:
@@ -338,13 +397,11 @@ class ProgressiveToolBridge:
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        # Apply Schema Shrinking (with safe bounded fallback for oversized)
         shadow_schemas = []
         for r in rows:
             try:
                 shadow_schemas.append(SchemaShrinker.shrink_tool(r))
             except ValueError:
-                # Oversized tool: fail-closed bounded diagnostic strictly <= 250B
                 raw_id = str(r[0])
                 bounded_id = (raw_id[:40] + "...[trunc]") if len(raw_id) > 50 else raw_id
                 diag = {

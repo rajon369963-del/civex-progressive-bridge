@@ -39,6 +39,14 @@ def test_headroom_critical_signals():
         assert "CRITICAL_ERROR" in str(res), f"Critical signal lost at offset {offset}"
     print("  ✅ [PASS] String boundary retention: all 8 offsets preserved CRITICAL_ERROR")
 
+    # Check middle marker in long strings (deep adversarial regression test)
+    for prefix_len in [200, 500, 800]:
+        for suffix_len in [200, 500, 800]:
+            payload = {"log": "A" * prefix_len + "CRITICAL_ERROR: segmentation fault" + "B" * suffix_len}
+            res = c.compress(payload, max_str_len=120)
+            assert "CRITICAL_ERROR" in str(res), f"Middle signal lost with prefix={prefix_len}, suffix={suffix_len}"
+    print("  ✅ [PASS] Middle marker retention: preserved across all long string middle positions")
+
     # Check text line omission: middle lines omitted but critical signals kept
     for line_idx in range(50):
         lines = [f"line {i}: normal telemetry ping" for i in range(50)]
@@ -129,6 +137,20 @@ v.record_outcome("tool_multiprocess", False, "process crash")
             raise AssertionError("Corrupt state file should have raised ValueError")
         except ValueError:
             print("  ✅ [PASS] Corrupt state file rejected fail-closed with ValueError")
+
+        # Test legacy flat dictionary migration
+        legacy_file = f"/tmp/test_cb_legacy_{os.getpid()}_{time.time_ns()}.json"
+        with open(legacy_file, "w") as f:
+            json.dump({"legacy_tool_1": 3, "legacy_tool_2": 1}, f)
+        CIVeXVerifier.STATE_FILE = legacy_file
+        legacy_v = CIVeXVerifier()
+        assert legacy_v.failure_counts["legacy_tool_1"] == 3
+        assert legacy_v.is_circuit_open("legacy_tool_1") is True
+        print("  ✅ [PASS] Legacy flat circuit breaker state auto-migrated cleanly")
+        if os.path.exists(legacy_file):
+            os.remove(legacy_file)
+        if os.path.exists(legacy_file + ".lock"):
+            os.remove(legacy_file + ".lock")
 
     finally:
         for p in [state_file, state_file + ".lock"]:
@@ -246,6 +268,12 @@ def test_civex_causal_assertions():
         # Pre-execution: file does not exist
         pre_hash = verifier.hash_file(test_file)
         assert pre_hash is None
+
+        # Scenario 0: Missing target file (phantom execution / false green trap)
+        missing_file = f"/tmp/civex_phantom_{os.getpid()}_{time.time_ns()}.txt"
+        res0 = verifier.verify_causal_write(missing_file, pre_hash=None, exit_code=0)
+        assert res0["verdict"] == "TARGET_MISSING", f"Expected TARGET_MISSING, got {res0['verdict']}"
+        print("  ✅ [PASS] Missing target file rejected as TARGET_MISSING")
 
         # Scenario 1: Non-zero exit code
         res1 = verifier.verify_causal_write(test_file, pre_hash, exit_code=127)

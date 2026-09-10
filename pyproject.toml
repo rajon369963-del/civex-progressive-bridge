@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "civex-progressive-bridge"
 version = "0.1.0"
-description = "Sub-50µs progressive tool disclosure engine for LLMs with 5,000+ tools"
+description = "Sub-millisecond progressive tool disclosure engine for LLMs with 5,000+ tools"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
