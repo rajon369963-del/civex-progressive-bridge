@@ -378,7 +378,7 @@ class CourtAwareRanker:
                         rationale=f"FAIL-CLOSED: Malformed verified_at timestamp '{verified_at_str}' for {tool_name}: {e}"
                     )
 
-            # 3. Empirical Execution Supervision (Structured JSON match, zero LIKE substring)
+            # 3. Empirical Execution Supervision (C11 Supervisor Mandatory, zero LIKE substring)
             if supervised_val is None:
                 if "trace_events" in tables:
                     cur.execute("""
@@ -388,6 +388,8 @@ class CourtAwareRanker:
                                OR json_extract(details_json, '$.binary_path') = ?)
                           AND stage = 'PROCESS_EXECUTION'
                           AND parent_span_id IS NOT NULL
+                          AND (producer = 'air10_exec_boundary_c11' 
+                               OR json_extract(details_json, '$.supervisor') = 'air10_exec_boundary_c11')
                     """, (tool_name, effective_id, binary_path or tool_name))
                     sup_count = cur.fetchone()[0]
                     supervised_val = (sup_count > 0)
@@ -395,7 +397,7 @@ class CourtAwareRanker:
                     supervised_val = False
 
                 if not supervised_val:
-                    # FAIL-CLOSED: Missing supervision evidence cannot assume Supervised=True
+                    # FAIL-CLOSED: Missing C11 supervision evidence cannot assume Supervised=True
                     conn.close()
                     return ToolScoreBreakdown(
                         tool_name=tool_name,
@@ -409,7 +411,7 @@ class CourtAwareRanker:
                         safety=0.0,
                         final_score=0.0,
                         status="SUPERVISION_UNVERIFIED_HOLD",
-                        rationale=f"FAIL-CLOSED: No supervised process execution trace recorded in audit DB for {tool_name}"
+                        rationale=f"FAIL-CLOSED: No C11 supervised process execution trace recorded in audit DB for {tool_name}"
                     )
 
             conn.close()

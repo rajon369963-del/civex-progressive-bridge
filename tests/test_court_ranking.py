@@ -38,10 +38,10 @@ def hermetic_court_env(tmp_path):
             router_candidates TEXT NOT NULL,
             chosen_tool TEXT NOT NULL,
             binary_path TEXT NOT NULL,
-            binary_sha256 TEXT NOT NULL,
+            binary_sha256 TEXT,
             input_path TEXT NOT NULL,
             input_sha256 TEXT NOT NULL,
-            stdout_sha256 TEXT NOT NULL,
+            stdout_sha256 TEXT,
             actual_exit_code INTEGER NOT NULL,
             duration_ms REAL NOT NULL,
             semantic_equivalence TEXT NOT NULL,
@@ -105,8 +105,8 @@ def hermetic_court_env(tmp_path):
 
     cur.execute("""
         INSERT INTO trace_events VALUES
-        (NULL, 'tr_mock_ok', 'span_01', 'span_root', 'PROCESS_EXECUTION', 'civex_exec', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_ok", "tool_id": "tool_ok"}'),
-        (NULL, 'tr_mock_warn', 'span_02', 'span_root', 'PROCESS_EXECUTION', 'civex_exec', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_warning", "tool_id": "tool_warning"}');
+        (NULL, 'tr_mock_ok', 'span_01', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_ok", "tool_id": "tool_ok", "supervisor": "air10_exec_boundary_c11"}'),
+        (NULL, 'tr_mock_warn', 'span_02', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_warning", "tool_id": "tool_warning", "supervisor": "air10_exec_boundary_c11"}');
     """)
     conn.commit()
     conn.close()

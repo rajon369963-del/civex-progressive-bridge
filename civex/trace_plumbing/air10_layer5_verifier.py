@@ -224,6 +224,37 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
                     semantic_result = "ACCEPTANCE_ONLY_NO_AST_OUTPUT"
                     failure_reason = "VALID_SINGLE_DOCUMENT_FULLY_CONSUMED_NO_AST_CAPTURE"
 
+    sha_hex_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
+    ZERO_SENTINEL = "0" * 64
+    F_SENTINEL = "f" * 64
+
+    # Cryptographic digest integrity checks (Fail-Closed, execution attestation binding, NO post-hoc backfill)
+    binary_sha256 = exec_bin_sha
+    if not binary_sha256 or binary_sha256 == ZERO_SENTINEL or binary_sha256 == F_SENTINEL or not sha_hex_pattern.match(binary_sha256):
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        semantic_result = "MISSING_EXECUTION_ATTESTATION"
+        failure_reason = f"FAIL-CLOSED: exec_bin_sha is missing, invalid hex, or synthetic sentinel: '{binary_sha256}'"
+        binary_sha256 = None
+    elif target_bin and os.path.isfile(target_bin):
+        with open(target_bin, "rb") as bf:
+            disk_bin_sha = hashlib.sha256(bf.read()).hexdigest()
+        if binary_sha256 != disk_bin_sha:
+            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+            semantic_result = "BINARY_INTEGRITY_VIOLATION"
+            failure_reason = f"FAIL-CLOSED: binary_sha256 '{binary_sha256}' does not match disk binary SHA '{disk_bin_sha}'"
+
+    stdout_sha256 = exec_stdout_sha
+    if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or stdout_sha256 == F_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        if not semantic_result or semantic_result.startswith("ACCEPTANCE_ONLY") or semantic_result == "EXACT_AST_MATCH":
+            semantic_result = "MISSING_EXECUTION_ATTESTATION"
+        failure_reason = f"FAIL-CLOSED: exec_stdout_sha is missing, invalid hex, or synthetic sentinel: '{stdout_sha256}'"
+        stdout_sha256 = None
+
+    if verdict_status != "VERIFIED_PASS" and (binary_sha256 is None or stdout_sha256 is None):
+        if not semantic_result or semantic_result.startswith("ACCEPTANCE_ONLY") or semantic_result == "EXACT_AST_MATCH":
+            semantic_result = "MISSING_EXECUTION_ATTESTATION"
+
     details = {
         "verifier": "AIR10_STRICT_RFC8259_VERIFIER_V2",
         "has_trailing_bytes": has_trailing,
@@ -235,6 +266,8 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         "input_sha256": current_input_sha256,
         "target_bin": target_bin,
         "actual_returncode": actual_returncode,
+        "binary_sha256": binary_sha256,
+        "stdout_sha256": stdout_sha256,
     }
     payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
@@ -246,59 +279,11 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         VALUES (?, ?, ?, 'INDEPENDENT_VERIFICATION', 'rfc8259_semantic_verifier', ?, ?, ?, ?)
     """, (trace_id, span_id, parent_exec_span, now_iso, payload_sha256, verdict_status, json.dumps(details)))
 
-    # Append immutable summary to tool_traces_v2 (Physical 64-char SHA-256 digests)
+    # Append immutable summary to tool_traces_v2 (Physical 64-char SHA-256 digests or NULL, zero synthetic sentinels)
     task_intent = intent_info.get("details", {}).get("intent", "UNKNOWN_INTENT")
     router_details = router_info.get("details", {})
     chosen_tool = router_details.get("chosen_tool", target_bin)
     candidates_json = json.dumps(router_details.get("candidates", []))
-
-    sha_hex_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
-    ZERO_SENTINEL = "0" * 64
-
-    # Cryptographic digest integrity checks (Fail-Closed, zero synthetic sentinels, NO assert)
-    binary_sha256 = exec_bin_sha
-    if not binary_sha256 or binary_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(binary_sha256):
-        if target_bin and os.path.isfile(target_bin):
-            with open(target_bin, "rb") as bf:
-                binary_sha256 = hashlib.sha256(bf.read()).hexdigest()
-        else:
-            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
-            semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
-            failure_reason = f"FAIL-CLOSED: binary_sha256 is missing, invalid hex, or synthetic zero sentinel: '{binary_sha256}'"
-
-    if not binary_sha256 or binary_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(binary_sha256):
-        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
-        semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
-        failure_reason = f"FAIL-CLOSED: binary_sha256 is missing, invalid hex, or synthetic zero sentinel: '{binary_sha256}'"
-
-    if target_bin and os.path.isfile(target_bin):
-        with open(target_bin, "rb") as bf:
-            disk_bin_sha = hashlib.sha256(bf.read()).hexdigest()
-        if binary_sha256 and binary_sha256 != disk_bin_sha:
-            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
-            semantic_result = "BINARY_INTEGRITY_VIOLATION"
-            failure_reason = f"FAIL-CLOSED: binary_sha256 '{binary_sha256}' does not match disk binary SHA '{disk_bin_sha}'"
-
-    stdout_sha256 = exec_stdout_sha
-    if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
-        if target_stdout_file and os.path.isfile(target_stdout_file):
-            with open(target_stdout_file, "rb") as sf:
-                stdout_sha256 = hashlib.sha256(sf.read()).hexdigest()
-        else:
-            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
-            semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
-            failure_reason = f"FAIL-CLOSED: stdout_sha256 is missing, invalid hex, or synthetic zero sentinel: '{stdout_sha256}'"
-
-    if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
-        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
-        semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
-        failure_reason = f"FAIL-CLOSED: stdout_sha256 is missing, invalid hex, or synthetic zero sentinel: '{stdout_sha256}'"
-
-    # Fallback to deterministic invalid SHA if validation failed, ensuring ledger write does not crash
-    if not binary_sha256 or len(binary_sha256) != 64:
-        binary_sha256 = "f" * 64
-    if not stdout_sha256 or len(stdout_sha256) != 64:
-        stdout_sha256 = "f" * 64
 
     cur.execute("""
         INSERT INTO tool_traces_v2

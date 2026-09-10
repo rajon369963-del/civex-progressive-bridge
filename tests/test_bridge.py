@@ -362,7 +362,7 @@ def test_hydrate_tool_court_enforcement(tmp_path):
 
     # 1. Ranker None -> FAIL CLOSED
     bridge.ranker = None
-    refused = bridge.hydrate_tool("tool_unverified", enforce_court=True)
+    refused = bridge.hydrate_tool("tool_unverified")
     assert refused["court_verdict"] == "REFUSED_FAIL_CLOSED"
     assert refused["binary_path"] is None
     assert refused["exec_template"] is None
@@ -387,24 +387,25 @@ def test_hydrate_tool_court_enforcement(tmp_path):
 
     bridge.ranker = MockRanker()
 
-    # Tool unverified with enforce_court=True -> Refused
-    refused_court = bridge.hydrate_tool("tool_unverified", enforce_court=True)
+    # Tool unverified -> Mandatory Refused fail closed
+    refused_court = bridge.hydrate_tool("tool_unverified")
     assert refused_court["court_verdict"] == "REFUSED_FAIL_CLOSED"
     assert refused_court["court_status"] == "CONTRACT_QUARANTINED"
     assert refused_court["binary_path"] is None
     assert refused_court["exec_template"] is None
     print("  ✅ [PASS] Quarantined tool hydration blocked with REFUSED_FAIL_CLOSED")
 
-    # Tool unverified with enforce_court=False -> Bypasses check, returns full schema
-    bypassed = bridge.hydrate_tool("tool_unverified", enforce_court=False)
-    assert bypassed["tool_id"] == "tool_unverified"
-    assert bypassed["binary_path"] == "/bin/echo"
-    assert bypassed["exec_template"] == "/bin/echo {args}"
-    assert "court_verdict" not in bypassed
-    print("  ✅ [PASS] enforce_court=False allows administrative schema retrieval")
+    # Non-executable inspection: inspect_tool_metadata returns schema metadata but strictly omits binary_path and exec_template
+    meta = bridge.inspect_tool_metadata("tool_unverified")
+    assert meta["tool_id"] == "tool_unverified"
+    assert meta["name"] == "tool_unverified"
+    assert meta["category"] == "cat"
+    assert "binary_path" not in meta
+    assert "exec_template" not in meta
+    print("  ✅ [PASS] inspect_tool_metadata provides catalog inspection without exposing executable parameters")
 
-    # Tool verified with enforce_court=True -> Allowed
-    allowed = bridge.hydrate_tool("tool_verified", enforce_court=True)
+    # Tool verified -> Allowed
+    allowed = bridge.hydrate_tool("tool_verified")
     assert allowed["tool_id"] == "tool_verified"
     assert allowed["binary_path"] == "/bin/echo"
     assert allowed["court_status"] == "ELIGIBLE"

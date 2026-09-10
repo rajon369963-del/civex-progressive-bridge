@@ -22,9 +22,11 @@ for local execution and remote GitHub Actions CI matrix:
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import pytest
 from civex.bridge import ProgressiveToolBridge
@@ -64,10 +66,10 @@ def hermetic_audit_db(tmp_path):
         router_candidates TEXT NOT NULL,
         chosen_tool TEXT NOT NULL,
         binary_path TEXT NOT NULL,
-        binary_sha256 TEXT NOT NULL,
+        binary_sha256 TEXT,
         input_path TEXT NOT NULL,
         input_sha256 TEXT NOT NULL,
-        stdout_sha256 TEXT NOT NULL,
+        stdout_sha256 TEXT,
         actual_exit_code INTEGER NOT NULL,
         duration_ms REAL NOT NULL,
         semantic_equivalence TEXT NOT NULL,
@@ -159,10 +161,10 @@ def test_gate1_pristine_baseline(hermetic_audit_db, mock_binaries):
     conn.execute("""
         INSERT INTO trace_events VALUES (
             NULL, 'tr_gate1_pristine', 'span_01', 'span_root',
-            'PROCESS_EXECUTION', 'civex_executor', '2026-09-11T00:00:00Z',
+            'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z',
             'sha_payload', 'COMPLETED', ?
         )
-    """, (json.dumps({"tool_name": "test-valid-tool", "binary_path": mock_binaries["valid_path"]}),))
+    """, (json.dumps({"tool_name": "test-valid-tool", "binary_path": mock_binaries["valid_path"], "supervisor": "air10_exec_boundary_c11"}),))
     conn.commit()
     conn.close()
 
@@ -529,6 +531,13 @@ def test_gate15_toctou_input_integrity_mismatch_fail_closed(hermetic_audit_db, t
         f.write('{"test": "original"}')
     orig_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
 
+    bin_path = str(tmp_path / "echo_test.sh")
+    with open(bin_path, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(bin_path, 0o755)
+    bin_sha = hashlib.sha256(open(bin_path, "rb").read()).hexdigest()
+    out_sha = hashlib.sha256(b"mock_stdout").hexdigest()
+
     trace_id = "tr_gate15_toctou"
     conn = sqlite3.connect(hermetic_audit_db)
     conn.execute("""
@@ -536,13 +545,13 @@ def test_gate15_toctou_input_integrity_mismatch_fail_closed(hermetic_audit_db, t
         (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
         VALUES (?, 'span_exec_01', 'span_root', 'PROCESS_EXECUTION', 'c11_supervisor', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
     """, (trace_id, json.dumps({
-        "binary_path": "/bin/echo",
-        "binary_sha256": "0" * 64,
+        "binary_path": bin_path,
+        "binary_sha256": bin_sha,
         "input_file": input_file,
         "input_sha256": orig_sha,
         "actual_returncode": 0,
         "duration_ms": 1.0,
-        "stdout_sha256": "0" * 64
+        "stdout_sha256": out_sha
     })))
     conn.commit()
     conn.close()
@@ -633,7 +642,6 @@ def test_gate17_c11_stdout_preservation_and_arbitrary_argv(tmp_path):
 
 def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_path):
     """Gate 18: tool_traces_v2 must store physical 64-char SHA-256 digests, zero placeholder strings."""
-    import re
 
     from civex.trace_plumbing.air10_layer5_verifier import verify_trace
 
@@ -719,6 +727,17 @@ def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_pat
 
     verdict_fake = verify_trace(trace_id_fake, target_stdout_file=stdout_file, audit_db_path=hermetic_audit_db)
     assert verdict_fake == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    # Assert NULL digest and MISSING_EXECUTION_ATTESTATION stored in tool_traces_v2 (zero "f"*64)
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (trace_id_fake,))
+    fake_row = cur.fetchone()
+    conn.close()
+    assert fake_row is not None
+    assert fake_row["binary_sha256"] is None, "Synthetic sentinel must be stored as SQL NULL, not 'f'*64"
+    assert fake_row["semantic_equivalence"] == "MISSING_EXECUTION_ATTESTATION"
 
 
 def test_gate19_full_closed_loop_reality_test(hermetic_audit_db, tmp_path, monkeypatch):
@@ -906,4 +925,463 @@ def test_gate19_full_closed_loop_reality_test(hermetic_audit_db, tmp_path, monke
     verif_details = json.loads(verif_row[0])
     assert verif_details["semantic_result"] == "STDOUT_TOCTOU_INTEGRITY_VIOLATION"
     assert "STDOUT_TOCTOU_MUTATION_DETECTED" in verif_details["failure_reason"]
+
+
+def test_gate20_autonomous_self_healing_closed_loop(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 20: True Autonomous Self-Healing Closed Loop Reality Test.
+    Proves that:
+    1. Two candidate tools exist: flaky_primary and resilient_fallback.
+    2. Initial state: both are ALLOWED in tool_contract_verdicts_v2. flaky_primary has lower latency (0.2ms vs 2.0ms), so router prefers it.
+    3. Layer 4 executes flaky_primary -> Layer 5 verifier evaluates trace -> verification fails.
+    4. Layer 5 internally calls CIVeXVerifier().record_outcome() to increment failure count.
+    5. After 3 consecutive real Layer 4->5 failures of flaky_primary, circuit breaker trips to OPEN.
+    6. On 4th intent route with the SAME candidate pool, router automatically skips flaky_primary (circuit OPEN) and selects resilient_fallback.
+    7. Layer 4 executes resilient_fallback via C11 supervisor -> Layer 5 verifies -> VERIFIED_PASS.
+    8. ZERO manual record_outcome() calls throughout the entire loop.
+    """
+    from civex.bridge import CIVeXVerifier
+    from civex.trace_plumbing import (
+        air10_layer2_router,
+        air10_layer4_executor,
+        air10_layer5_verifier,
+    )
+
+    # Configure hermetic DB and state file
+    monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer4_executor, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    cb_state_file = str(tmp_path / "gate20_cb_state.json")
+    monkeypatch.setattr(CIVeXVerifier, "STATE_FILE", cb_state_file)
+
+    # Physical binaries
+    # 1. flaky_primary: Exits with code 1, causing Layer 5 verification to fail
+    flaky_bin = str(tmp_path / "flaky_primary.sh")
+    with open(flaky_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(flaky_bin, 0o755)
+    flaky_sha = hashlib.sha256(open(flaky_bin, "rb").read()).hexdigest()
+
+    # 2. resilient_fallback: Valid script that echoes valid JSON input
+    resilient_bin = str(tmp_path / "resilient_fallback.sh")
+    with open(resilient_bin, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nfor arg do last="$arg"; done\ncat "$last"\nexit 0\n')
+    os.chmod(resilient_bin, 0o755)
+    resilient_sha = hashlib.sha256(open(resilient_bin, "rb").read()).hexdigest()
+
+    # Valid input file
+    valid_input = str(tmp_path / "gate20_input.json")
+    with open(valid_input, "w", encoding="utf-8") as f:
+        f.write('{"service": "civex_autonomous_healing", "active": true}')
+    valid_input_sha = hashlib.sha256(open(valid_input, "rb").read()).hexdigest()
+
+    # Seed hermetic DB with contracts and baseline telemetry
+    conn = sqlite3.connect(hermetic_audit_db)
+    # flaky_primary: lower latency (0.2ms) to make it primary choice
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('flaky_primary', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'BASELINE_APPROVED', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (flaky_bin, flaky_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_flaky', 'JSON_PARSE', 'BATCH', '[]', 'flaky_primary', ?, ?, ?, ?, ?, 0, 0.20, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (flaky_bin, flaky_sha, valid_input, valid_input_sha, flaky_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_flaky', 'span_seed_flaky', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "flaky_primary", "binary_path": flaky_bin}),))
+
+    # resilient_fallback: higher latency (2.0ms), so ranked second
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('resilient_fallback', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'BASELINE_APPROVED', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (resilient_bin, resilient_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_resilient', 'JSON_PARSE', 'BATCH', '[]', 'resilient_fallback', ?, ?, ?, ?, ?, 0, 2.00, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (resilient_bin, resilient_sha, valid_input, valid_input_sha, resilient_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_resilient', 'span_seed_resilient', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "resilient_fallback", "binary_path": resilient_bin}),))
+    conn.commit()
+    conn.close()
+
+    candidate_pool = [
+        {"name": "flaky_primary", "binary": flaky_bin},
+        {"name": "resilient_fallback", "binary": resilient_bin}
+    ]
+
+    # Verify circuit is initially closed for flaky_primary
+    verifier = CIVeXVerifier()
+    assert not verifier.is_circuit_open("flaky_primary")
+    assert not verifier.is_circuit_open("resilient_fallback")
+
+    # Run 3 consecutive execution-to-verification cycles on flaky_primary
+    # Layer 5 must naturally trip the breaker via its internal feedback
+    for attempt in range(1, 4):
+        t_id = f"tr_gate20_fail_{attempt}"
+        c_tool, c_bin, r_span = air10_layer2_router.route_intent(
+            trace_id=t_id,
+            parent_span_id="span_root_g20",
+            intent_query="strict single doc json parse",
+            required_capability="JSON_SINGLE_DOC_STRICT",
+            candidates_override=candidate_pool
+        )
+        assert c_tool == "flaky_primary", f"Attempt {attempt}: expected flaky_primary, got {c_tool}"
+        assert c_bin == flaky_bin
+
+        out_f = str(tmp_path / f"out_flaky_{attempt}.json")
+        rc, dur_ms, out_sha = air10_layer4_executor.execute_process(
+            trace_id=t_id,
+            binary_path=c_bin,
+            input_file=valid_input,
+            parent_span_id=r_span,
+            output_file=out_f,
+            argv=[valid_input]
+        )
+        assert rc == 1  # flaky_primary exited 1
+
+        # Layer 5 verification evaluates trace and internally updates circuit breaker
+        verdict = air10_layer5_verifier.verify_trace(
+            trace_id=t_id,
+            target_stdout_file=out_f,
+            audit_db_path=hermetic_audit_db
+        )
+        assert verdict == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    # Circuit breaker for flaky_primary is now TRIPPED (3 consecutive failures)
+    assert verifier.is_circuit_open("flaky_primary"), "Circuit breaker must be OPEN after 3 verifier failures"
+
+    # 4th intent route: with the EXACT SAME candidate pool, router must autonomously skip flaky_primary and pick resilient_fallback
+    t_id_4 = "tr_gate20_healed_04"
+    c_tool_4, c_bin_4, r_span_4 = air10_layer2_router.route_intent(
+        trace_id=t_id_4,
+        parent_span_id="span_root_g20",
+        intent_query="strict single doc json parse",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=candidate_pool
+    )
+    assert c_tool_4 == "resilient_fallback", f"Expected autonomous failover to resilient_fallback, got {c_tool_4}"
+    assert c_bin_4 == resilient_bin
+
+    # Execute resilient_fallback via C11 supervisor
+    out_healed = str(tmp_path / "out_healed_04.json")
+    rc_4, dur_ms_4, out_sha_4 = air10_layer4_executor.execute_process(
+        trace_id=t_id_4,
+        binary_path=c_bin_4,
+        input_file=valid_input,
+        parent_span_id=r_span_4,
+        output_file=out_healed,
+        argv=[valid_input]
+    )
+    assert rc_4 == 0
+
+    # Layer 5 verifies healed trace to VERIFIED_PASS
+    verdict_4 = air10_layer5_verifier.verify_trace(
+        trace_id=t_id_4,
+        target_stdout_file=out_healed,
+        audit_db_path=hermetic_audit_db
+    )
+    assert verdict_4 == "VERIFIED_PASS"
+    assert not verifier.is_circuit_open("resilient_fallback")
+
+
+def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 21: Full 5-Layer DAG Reality Test with SHA-256 Chain Validation.
+    Validates complete 5-layer pipeline:
+    Layer 1 (INTENT) -> Layer 2 (ROUTER) -> Layer 3 (HYDRATION) -> Layer 4 (C11 EXEC) -> Layer 5 (VERIFIER).
+    Asserts strict causal parent-child span DAG linkages, payload hashes, and ledger persistence.
+    """
+    from civex.bridge import inspect_tool_metadata
+    from civex.trace_plumbing import (
+        air10_layer2_router,
+        air10_layer4_executor,
+        air10_layer5_verifier,
+    )
+
+    monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer4_executor, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    # Physical binary
+    dag_bin = str(tmp_path / "dag_worker.sh")
+    with open(dag_bin, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nfor arg do last="$arg"; done\ncat "$last"\nexit 0\n')
+    os.chmod(dag_bin, 0o755)
+    dag_bin_sha = hashlib.sha256(open(dag_bin, "rb").read()).hexdigest()
+
+    input_file = str(tmp_path / "dag_input.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"dag_layer": 5, "verified": true}')
+    input_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    output_file = str(tmp_path / "dag_output.json")
+
+    # Seed contract and baseline trace
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('dag_worker', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'APPROVED', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (dag_bin, dag_bin_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_dag', 'JSON_PARSE', 'BATCH', '[]', 'dag_worker', ?, ?, ?, ?, ?, 0, 1.0, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (dag_bin, dag_bin_sha, input_file, input_sha, dag_bin_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_dag', 'span_seed_dag', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "dag_worker", "binary_path": dag_bin}),))
+    conn.commit()
+    conn.close()
+
+    trace_id = "tr_gate21_full_dag"
+
+    # Layer 1: INTENT
+    span_intent_id = "span_intent_g21"
+    intent_payload = {
+        "intent": "parse strict single doc json with full DAG reality",
+        "required_capability": "JSON_SINGLE_DOC_STRICT",
+        "input_format": "SINGLE_DOC_STRICT_RFC8259"
+    }
+    intent_payload_sha = hashlib.sha256(json.dumps(intent_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, NULL, 'INTENT', 'civex_intent_orchestrator', ?, ?, 'COMPLETED', ?)
+    """, (trace_id, span_intent_id, now_iso, intent_payload_sha, json.dumps(intent_payload)))
+    conn.commit()
+    conn.close()
+
+    # Layer 2: ROUTER
+    candidate_pool = [{"name": "dag_worker", "binary": dag_bin}]
+    chosen_tool, chosen_bin, span_router_id = air10_layer2_router.route_intent(
+        trace_id=trace_id,
+        parent_span_id=span_intent_id,
+        intent_query="parse strict single doc json",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=candidate_pool
+    )
+    assert chosen_tool == "dag_worker"
+    assert chosen_bin == dag_bin
+
+    # Layer 3: HYDRATION (Tool Hydration with safe metadata inspection)
+    span_hydr_id = "span_hydr_g21"
+    hydr_payload = {
+        "tool_id": chosen_tool,
+        "metadata": inspect_tool_metadata(chosen_tool),
+        "hydrated_executable": chosen_bin
+    }
+    hydr_sha = hashlib.sha256(json.dumps(hydr_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'TOOL_HYDRATION', 'civex_hydration_engine', ?, ?, 'COMPLETED', ?)
+    """, (trace_id, span_hydr_id, span_router_id, now_iso, hydr_sha, json.dumps(hydr_payload)))
+    conn.commit()
+    conn.close()
+
+    # Layer 4: PROCESS_EXECUTION (C11 supervised execution)
+    rc, dur_ms, out_sha = air10_layer4_executor.execute_process(
+        trace_id=trace_id,
+        binary_path=chosen_bin,
+        input_file=input_file,
+        parent_span_id=span_hydr_id,
+        output_file=output_file,
+        argv=[input_file]
+    )
+    assert rc == 0
+
+    # Layer 5: INDEPENDENT_VERIFICATION
+    verdict = air10_layer5_verifier.verify_trace(
+        trace_id=trace_id,
+        target_stdout_file=output_file,
+        audit_db_path=hermetic_audit_db
+    )
+    assert verdict == "VERIFIED_PASS"
+
+    # Assert Complete 5-Layer DAG Structure & Causal Links
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM trace_events WHERE trace_id = ? ORDER BY event_id ASC", (trace_id,))
+    events = cur.fetchall()
+    conn.close()
+
+    assert len(events) == 5, f"Expected 5 spans in DAG, got {len(events)}"
+    stages = [e["stage"] for e in events]
+    assert stages == ["INTENT", "ROUTER_EVALUATION", "TOOL_HYDRATION", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"]
+
+    # Verify causal parent-child pointers
+    assert events[0]["parent_span_id"] is None
+    assert events[1]["parent_span_id"] == events[0]["span_id"]
+    assert events[2]["parent_span_id"] == events[1]["span_id"]
+    assert events[3]["parent_span_id"] == events[2]["span_id"]
+    assert events[4]["parent_span_id"] == events[3]["span_id"]
+
+    # Verify all payload SHA-256 are valid 64-char hex strings
+    hex_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
+    for e in events:
+        assert hex_pattern.match(e["payload_sha256"])
+
+    # Verify tool_traces_v2 record
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    t_row = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (trace_id,)).fetchone()
+    conn.close()
+    assert t_row is not None
+    assert t_row["chosen_tool"] == "dag_worker"
+    assert t_row["verification_status"] == "VERIFIED_PASS"
+    assert t_row["semantic_equivalence"] == "EXACT_AST_MATCH"
+    assert t_row["binary_sha256"] == dag_bin_sha
+    assert t_row["stdout_sha256"] == out_sha
+
+
+def test_gate22_attestation_binding_and_anti_aba(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 22: Attestation Binding & Anti-ABA Reality Test.
+    1. Missing execution digest fails closed without disk backfill; recorded as SQL NULL in ledger.
+    2. Post-execution binary mutation (Anti-ABA attack) fails closed with BINARY_INTEGRITY_VIOLATION.
+    3. CourtAwareRanker supervision check: rejects candidates without C11 supervisor.
+    """
+    from civex.court_ranking import CourtAwareRanker
+    from civex.trace_plumbing import air10_layer5_verifier
+
+    monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    # 1. Missing execution digest fails closed without disk backfill, stores NULL in tool_traces_v2
+    input_file = str(tmp_path / "g22_input.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"key": "value"}')
+    in_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    test_bin = str(tmp_path / "g22_tool.sh")
+    with open(test_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\ncat $1\nexit 0\n")
+    os.chmod(test_bin, 0o755)
+    test_bin_sha = hashlib.sha256(open(test_bin, "rb").read()).hexdigest()
+
+    # Trace with missing stdout_sha256
+    t_id_missing = "tr_gate22_missing_attest"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g22_m', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (t_id_missing, json.dumps({
+        "binary_path": test_bin,
+        "binary_sha256": test_bin_sha,
+        "input_file": input_file,
+        "input_sha256": in_sha,
+        "actual_returncode": 0,
+        "duration_ms": 1.0,
+        # stdout_sha256 omitted
+    })))
+    conn.commit()
+    conn.close()
+
+    verdict_m = air10_layer5_verifier.verify_trace(t_id_missing, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    assert verdict_m == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    row_m = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (t_id_missing,)).fetchone()
+    conn.close()
+    assert row_m is not None
+    assert row_m["stdout_sha256"] is None, "Missing digest must be stored as SQL NULL"
+    assert row_m["semantic_equivalence"] == "MISSING_EXECUTION_ATTESTATION"
+
+    # 2. Anti-ABA: Post-execution binary mutation detected fail-closed
+    t_id_aba = "tr_gate22_anti_aba"
+    aba_bin = str(tmp_path / "aba_tool.sh")
+    with open(aba_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(aba_bin, 0o755)
+    aba_orig_sha = hashlib.sha256(open(aba_bin, "rb").read()).hexdigest()
+    aba_stdout_sha = hashlib.sha256(b"output").hexdigest()
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g22_aba', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (t_id_aba, json.dumps({
+        "binary_path": aba_bin,
+        "binary_sha256": aba_orig_sha,
+        "input_file": input_file,
+        "input_sha256": in_sha,
+        "actual_returncode": 0,
+        "duration_ms": 1.0,
+        "stdout_sha256": aba_stdout_sha
+    })))
+    conn.commit()
+    conn.close()
+
+    # Mutate the binary on disk before Layer 5 verification (Anti-ABA attack)
+    with open(aba_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n# MUTATED TAMPERED CONTENT\nexit 0\n")
+
+    verdict_aba = air10_layer5_verifier.verify_trace(t_id_aba, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    assert verdict_aba == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    cur = conn.cursor()
+    cur.execute("SELECT details_json FROM trace_events WHERE trace_id = ? AND stage = 'INDEPENDENT_VERIFICATION'", (t_id_aba,))
+    aba_details = json.loads(cur.fetchone()[0])
+    conn.close()
+    assert aba_details["semantic_result"] == "BINARY_INTEGRITY_VIOLATION"
+    assert "does not match disk binary SHA" in aba_details["failure_reason"]
+
+    # 3. CourtAwareRanker C11 Supervisor Enforcement
+    # Candidate with unverified supervisor (e.g. producer='python_unsafe') must fail supervision check
+    unsup_bin = str(tmp_path / "unsup_tool.sh")
+    with open(unsup_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(unsup_bin, 0o755)
+    unsup_bin_sha = hashlib.sha256(open(unsup_bin, "rb").read()).hexdigest()
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('unsupervised_tool', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'APPROVED', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (unsup_bin, unsup_bin_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_unsupervised', 'JSON_PARSE', 'BATCH', '[]', 'unsupervised_tool', ?, ?, ?, ?, ?, 0, 1.0, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (unsup_bin, unsup_bin_sha, input_file, in_sha, unsup_bin_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_unsupervised', 'span_unsup', 'span_root', 'PROCESS_EXECUTION', 'python_unsafe_direct', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "unsupervised_tool", "binary_path": unsup_bin}),))
+    conn.commit()
+    conn.close()
+
+    from civex.bridge import CIVeXVerifier
+    ranker = CourtAwareRanker(audit_db_path=hermetic_audit_db, verifier=CIVeXVerifier())
+    score = ranker.score_tool(
+        tool_name="unsupervised_tool",
+        capability="JSON_SINGLE_DOC_STRICT",
+        binary_path=unsup_bin
+    )
+    assert score.status == "SUPERVISION_UNVERIFIED_HOLD"
+    assert score.final_score == 0.0
+    assert "No C11 supervised process execution trace" in score.rationale
+
 

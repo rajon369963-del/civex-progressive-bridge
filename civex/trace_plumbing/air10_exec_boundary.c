@@ -24,6 +24,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <errno.h>
+#include <signal.h>
 
 /* Minimal Self-Contained SHA-256 implementation */
 typedef struct {
@@ -121,6 +122,18 @@ static double timespec_to_ms(struct timespec ts) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
+static void terminate_and_reap_child(pid_t pid) {
+    if (pid <= 0) return;
+    kill(pid, SIGTERM);
+    usleep(10000); /* 10ms grace period */
+    int status;
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <TRACE_ID> <PARENT_SPAN_ID> <BINARY_PATH> [ARGS...]\n", argv[0]);
@@ -193,6 +206,7 @@ int main(int argc, char *argv[]) {
         for (int i = 4; i < argc; i++) {
             child_args[i - 3] = argv[i];
         }
+        child_argc = argc - 3;
         child_args[child_argc] = NULL;
 
         execv(binary_path, child_args);
@@ -210,10 +224,21 @@ int main(int argc, char *argv[]) {
     uint8_t buffer[8192];
     ssize_t bytes_read;
     size_t total_stdout_bytes = 0;
+    int read_error = 0;
 
-    while ((bytes_read = read(pipe_out[0], buffer, sizeof(buffer))) > 0) {
-        sha256_update(&ctx, buffer, bytes_read);
-        total_stdout_bytes += bytes_read;
+    while (1) {
+        bytes_read = read(pipe_out[0], buffer, sizeof(buffer));
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "ERROR: Read from supervisor pipe failed: %s\n", strerror(errno));
+            read_error = 1;
+            break;
+        }
+        if (bytes_read == 0) {
+            break; /* EOF */
+        }
+        sha256_update(&ctx, buffer, (size_t)bytes_read);
+        total_stdout_bytes += (size_t)bytes_read;
         if (capture_fd >= 0) {
             size_t written_total = 0;
             while (written_total < (size_t)bytes_read) {
@@ -223,6 +248,7 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "ERROR: Write to capture file '%s' failed: %s\n", capture_path, strerror(errno));
                     close(pipe_out[0]);
                     close(capture_fd);
+                    terminate_and_reap_child(pid);
                     return 74;
                 }
                 written_total += (size_t)w;
@@ -230,10 +256,18 @@ int main(int argc, char *argv[]) {
         }
     }
     close(pipe_out[0]);
+
+    if (read_error) {
+        if (capture_fd >= 0) close(capture_fd);
+        terminate_and_reap_child(pid);
+        return 75;
+    }
+
     if (capture_fd >= 0) {
         if (fsync(capture_fd) != 0) {
             fprintf(stderr, "ERROR: fsync on capture file '%s' failed: %s\n", capture_path, strerror(errno));
             close(capture_fd);
+            terminate_and_reap_child(pid);
             return 74;
         }
         close(capture_fd);
