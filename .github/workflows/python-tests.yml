@@ -48,13 +48,6 @@ jobs:
           cd "$TEST_DIR"
           HOME="$TEST_DIR/fake_home" "$TEST_DIR/venv/bin/civex-bridge" search "git" --limit 2
           HOME="$TEST_DIR/fake_home" "$TEST_DIR/venv/bin/civex-bridge" hydrate "tool_git_commit"
-          HOME="$TEST_DIR/fake_home" "$TEST_DIR/venv/bin/python" -c "
-import os
-from civex.bridge import ProgressiveToolBridge
-b = ProgressiveToolBridge()
-print('CI Loaded DB:', b.db_path)
-assert 'site-packages/civex/data/sample_catalog.sqlite' in b.db_path, f'Failed bundled path check: {b.db_path}'
-print('CI HOST-ISOLATED WHEEL PORTABILITY CONFIRMED')
-"
+          HOME="$TEST_DIR/fake_home" "$TEST_DIR/venv/bin/python" -c "import os; from civex.bridge import ProgressiveToolBridge; b = ProgressiveToolBridge(); print('CI Loaded DB:', b.db_path); assert 'site-packages/civex/data/sample_catalog.sqlite' in b.db_path, f'Failed bundled path check: {b.db_path}'; print('CI HOST-ISOLATED WHEEL PORTABILITY CONFIRMED')"
         )
         rm -rf "$TEST_DIR"
