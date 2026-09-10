@@ -24,6 +24,7 @@ import math
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -215,57 +216,199 @@ class CourtAwareRanker:
                 """, (tool_name, capability))
                 row = cur.fetchone()
 
+            # If no exact or wildcard contract registered: FAIL-CLOSED HOLD
+            if not row:
+                conn.close()
+                return ToolScoreBreakdown(
+                    tool_name=tool_name,
+                    capability=capability,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    correctness_confidence=0.0,
+                    availability=1.0 if binary_path else 0.5,
+                    performance=0.0,
+                    freshness=0.0,
+                    safety=0.0,
+                    final_score=0.0,
+                    status="CONTRACT_UNVERIFIED",
+                    rationale=f"FAIL-CLOSED: No verified contract registered for ({capability}, {input_format}, {contract_version})."
+                )
+
+            q_status, q_reason, superseded_by, certified_sha = row[:4]
+
+            # Binary Digest Attestation against certified court hash
+            if certified_sha and actual_bin_sha and certified_sha != actual_bin_sha:
+                conn.close()
+                return ToolScoreBreakdown(
+                    tool_name=tool_name,
+                    capability=capability,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    correctness_confidence=0.0,
+                    availability=0.0,
+                    performance=0.0,
+                    freshness=0.0,
+                    safety=0.0,
+                    final_score=0.0,
+                    status="BINARY_HASH_MISMATCH",
+                    rationale=f"SECURITY_ALERT: Physical binary digest {actual_bin_sha[:12]} does NOT match certified court digest {certified_sha[:12]}",
+                    binary_sha256=actual_bin_sha
+                )
+
+            # Status Evaluation: Check quarantine / invalid status before telemetry extraction
+            if q_status == "QUARANTINED":
+                conn.close()
+                return ToolScoreBreakdown(
+                    tool_name=tool_name,
+                    capability=capability,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    correctness_confidence=0.0,
+                    availability=1.0,
+                    performance=0.0,
+                    freshness=0.0,
+                    safety=0.0,
+                    final_score=0.0,
+                    status="QUARANTINED",
+                    rationale=f"HARD_EXCLUSION: Quarantined ({q_reason}). Superseded by {superseded_by}."
+                )
+            elif q_status == "ALLOWED_WITH_WARNING":
+                correctness = 0.70
+                status = "WARNING"
+                rationale = f"ALLOWED_WITH_WARNING: {q_reason}"
+            elif q_status == "ALLOWED":
+                correctness = 1.00
+                status = "ELIGIBLE"
+                rationale = f"VERIFIED_PASS: {q_reason}"
+            else:
+                conn.close()
+                return ToolScoreBreakdown(
+                    tool_name=tool_name,
+                    capability=capability,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    correctness_confidence=0.0,
+                    availability=0.0,
+                    performance=0.0,
+                    freshness=0.0,
+                    safety=0.0,
+                    final_score=0.0,
+                    status="UNKNOWN_STATUS_HOLD",
+                    rationale=f"FAIL-CLOSED: Unknown contract status '{q_status}'"
+                )
+
             # EMPIRICAL TELEMETRY EXTRACTION (Audit DB derived, zero synthetic constants)
-            if row:
-                # 1. Empirical Latency
+            # 1. Empirical Latency (Checked against VERIFIED_PASS and PASS)
+            if observed_ms is None:
+                if "tool_traces_v2" in tables:
+                    cur.execute("""
+                        SELECT AVG(duration_ms) FROM tool_traces_v2 
+                        WHERE (chosen_tool = ? OR chosen_tool = ?) AND verification_status IN ('VERIFIED_PASS', 'PASS')
+                    """, (tool_name, effective_id))
+                    lat_row = cur.fetchone()
+                    if lat_row and lat_row[0] is not None:
+                        observed_ms = float(lat_row[0])
+                if observed_ms is None and "tool_traces" in tables:
+                    cur.execute("""
+                        SELECT AVG(benchmark_p50_us) / 1000.0 FROM tool_traces
+                        WHERE tool_name = ? OR tool_name = ?
+                    """, (tool_name, effective_id))
+                    lat_row = cur.fetchone()
+                    if lat_row and lat_row[0] is not None:
+                        observed_ms = float(lat_row[0])
                 if observed_ms is None:
-                    if "tool_traces_v2" in tables:
-                        cur.execute("""
-                            SELECT AVG(duration_ms) FROM tool_traces_v2 
-                            WHERE (chosen_tool = ? OR chosen_tool = ?) AND verification_status = 'PASS'
-                        """, (tool_name, effective_id))
-                        lat_row = cur.fetchone()
-                        if lat_row and lat_row[0] is not None:
-                            observed_ms = float(lat_row[0])
-                    if observed_ms is None and "tool_traces" in tables:
-                        cur.execute("""
-                            SELECT AVG(benchmark_p50_us) / 1000.0 FROM tool_traces
-                            WHERE tool_name = ?
-                        """, (tool_name,))
-                        lat_row = cur.fetchone()
-                        if lat_row and lat_row[0] is not None:
-                            observed_ms = float(lat_row[0])
-                    if observed_ms is None:
-                        observed_ms = 10.0  # Conservative measured baseline if unobserved in traces
+                    # FAIL-CLOSED: No synthetic default latency allowed
+                    conn.close()
+                    return ToolScoreBreakdown(
+                        tool_name=tool_name,
+                        capability=capability,
+                        input_format=input_format,
+                        contract_version=contract_version,
+                        correctness_confidence=0.0,
+                        availability=0.0,
+                        performance=0.0,
+                        freshness=0.0,
+                        safety=0.0,
+                        final_score=0.0,
+                        status="TELEMETRY_UNAVAILABLE_HOLD",
+                        rationale=f"FAIL-CLOSED: No empirical latency telemetry recorded in audit DB for {tool_name}"
+                    )
 
-                # 2. Empirical Verification Freshness (from verified_at timestamp)
-                if verified_days is None:
-                    verified_at_str = row[4] if len(row) > 4 and row[4] else None
-                    if verified_at_str:
-                        try:
-                            clean_ts = verified_at_str.replace("Z", "+00:00")
-                            ver_dt = datetime.fromisoformat(clean_ts)
-                            now_dt = datetime.now(timezone.utc)
-                            delta_sec = max(0.0, (now_dt - ver_dt).total_seconds())
-                            verified_days = delta_sec / 86400.0
-                        except Exception:
-                            verified_days = 0.0
-                    else:
-                        verified_days = 0.0
+            # 2. Empirical Verification Freshness (from verified_at timestamp)
+            if verified_days is None:
+                verified_at_str = row[4] if len(row) > 4 and row[4] else None
+                if not verified_at_str:
+                    conn.close()
+                    return ToolScoreBreakdown(
+                        tool_name=tool_name,
+                        capability=capability,
+                        input_format=input_format,
+                        contract_version=contract_version,
+                        correctness_confidence=0.0,
+                        availability=0.0,
+                        performance=0.0,
+                        freshness=0.0,
+                        safety=0.0,
+                        final_score=0.0,
+                        status="FRESHNESS_EVIDENCE_HOLD",
+                        rationale=f"FAIL-CLOSED: Missing verified_at timestamp in contract verdict for {tool_name}"
+                    )
+                try:
+                    clean_ts = verified_at_str.replace("Z", "+00:00")
+                    ver_dt = datetime.fromisoformat(clean_ts)
+                    now_dt = datetime.now(timezone.utc)
+                    delta_sec = max(0.0, (now_dt - ver_dt).total_seconds())
+                    verified_days = delta_sec / 86400.0
+                except Exception as e:
+                    conn.close()
+                    return ToolScoreBreakdown(
+                        tool_name=tool_name,
+                        capability=capability,
+                        input_format=input_format,
+                        contract_version=contract_version,
+                        correctness_confidence=0.0,
+                        availability=0.0,
+                        performance=0.0,
+                        freshness=0.0,
+                        safety=0.0,
+                        final_score=0.0,
+                        status="FRESHNESS_EVIDENCE_HOLD",
+                        rationale=f"FAIL-CLOSED: Malformed verified_at timestamp '{verified_at_str}' for {tool_name}: {e}"
+                    )
 
-                # 3. Empirical Execution Supervision
-                if supervised_val is None:
-                    if "trace_events" in tables:
-                        cur.execute("""
-                            SELECT COUNT(*) FROM trace_events
-                            WHERE (details_json LIKE ? OR details_json LIKE ?)
-                              AND stage = 'PROCESS_EXECUTION'
-                              AND parent_span_id IS NOT NULL
-                        """, (f"%{tool_name}%", f"%{effective_id}%"))
-                        sup_count = cur.fetchone()[0]
-                        supervised_val = (sup_count > 0)
-                    else:
-                        supervised_val = True
+            # 3. Empirical Execution Supervision (Structured JSON match, zero LIKE substring)
+            if supervised_val is None:
+                if "trace_events" in tables:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM trace_events
+                        WHERE (json_extract(details_json, '$.tool_name') = ? 
+                               OR json_extract(details_json, '$.tool_id') = ?
+                               OR json_extract(details_json, '$.binary_path') = ?)
+                          AND stage = 'PROCESS_EXECUTION'
+                          AND parent_span_id IS NOT NULL
+                    """, (tool_name, effective_id, binary_path or tool_name))
+                    sup_count = cur.fetchone()[0]
+                    supervised_val = (sup_count > 0)
+                else:
+                    supervised_val = False
+
+                if not supervised_val:
+                    # FAIL-CLOSED: Missing supervision evidence cannot assume Supervised=True
+                    conn.close()
+                    return ToolScoreBreakdown(
+                        tool_name=tool_name,
+                        capability=capability,
+                        input_format=input_format,
+                        contract_version=contract_version,
+                        correctness_confidence=0.0,
+                        availability=0.0,
+                        performance=0.0,
+                        freshness=0.0,
+                        safety=0.0,
+                        final_score=0.0,
+                        status="SUPERVISION_UNVERIFIED_HOLD",
+                        rationale=f"FAIL-CLOSED: No supervised process execution trace recorded in audit DB for {tool_name}"
+                    )
 
             conn.close()
         except Exception as e:
@@ -285,95 +428,14 @@ class CourtAwareRanker:
                 rationale=f"FAIL-CLOSED: Audit DB query exception: {e}"
             )
 
-        # If no exact or wildcard contract registered: FAIL-CLOSED HOLD
-        if not row:
-            return ToolScoreBreakdown(
-                tool_name=tool_name,
-                capability=capability,
-                input_format=input_format,
-                contract_version=contract_version,
-                correctness_confidence=0.0,
-                availability=1.0 if binary_path else 0.5,
-                performance=0.0,
-                freshness=0.0,
-                safety=0.0,
-                final_score=0.0,
-                status="CONTRACT_UNVERIFIED",
-                rationale=f"FAIL-CLOSED: No verified contract registered for ({capability}, {input_format}, {contract_version})."
-            )
-
-        q_status, q_reason, superseded_by, certified_sha = row[:4]
-
-        # Binary Digest Attestation against certified court hash
-        if certified_sha and actual_bin_sha and certified_sha != actual_bin_sha:
-            return ToolScoreBreakdown(
-                tool_name=tool_name,
-                capability=capability,
-                input_format=input_format,
-                contract_version=contract_version,
-                correctness_confidence=0.0,
-                availability=0.0,
-                performance=0.0,
-                freshness=0.0,
-                safety=0.0,
-                final_score=0.0,
-                status="BINARY_HASH_MISMATCH",
-                rationale=f"SECURITY_ALERT: Physical binary digest {actual_bin_sha[:12]} does NOT match certified court digest {certified_sha[:12]}",
-                binary_sha256=actual_bin_sha
-            )
-
-        # Status Evaluation
-        if q_status == "QUARANTINED":
-            return ToolScoreBreakdown(
-                tool_name=tool_name,
-                capability=capability,
-                input_format=input_format,
-                contract_version=contract_version,
-                correctness_confidence=0.0,
-                availability=1.0,
-                performance=0.0,
-                freshness=0.0,
-                safety=0.0,
-                final_score=0.0,
-                status="QUARANTINED",
-                rationale=f"HARD_EXCLUSION: Quarantined ({q_reason}). Superseded by {superseded_by}."
-            )
-        elif q_status == "ALLOWED_WITH_WARNING":
-            correctness = 0.70
-            status = "WARNING"
-            rationale = f"ALLOWED_WITH_WARNING: {q_reason}"
-        elif q_status == "ALLOWED":
-            correctness = 1.00
-            status = "ELIGIBLE"
-            rationale = f"VERIFIED_PASS: {q_reason}"
-        else:
-            return ToolScoreBreakdown(
-                tool_name=tool_name,
-                capability=capability,
-                input_format=input_format,
-                contract_version=contract_version,
-                correctness_confidence=0.0,
-                availability=0.0,
-                performance=0.0,
-                freshness=0.0,
-                safety=0.0,
-                final_score=0.0,
-                status="UNKNOWN_STATUS_HOLD",
-                rationale=f"FAIL-CLOSED: Unknown contract status '{q_status}'"
-            )
-
         # 4. Discriminative Non-Saturating Latency Scoring
-        actual_lat = observed_ms if observed_ms is not None else 10.0
-        actual_days = verified_days if verified_days is not None else 0.0
-        actual_sup = supervised_val if supervised_val is not None else True
-
-        latency_score = 1.0 / (1.0 + max(0.0, actual_lat) / 10.0)
+        latency_score = 1.0 / (1.0 + max(0.0, observed_ms) / 10.0)
 
         # 5. Freshness Factor (decay over days since verification)
-        freshness = math.exp(-0.0231 * max(0.0, actual_days))
+        freshness = math.exp(-0.0231 * max(0.0, verified_days))
 
-        # 6. Safety Factor
-        safety = 1.00 if actual_sup else 0.80
+        # 6. Safety Factor (Strict empirical supervision requirement)
+        safety = 1.00 if supervised_val else 0.00
 
         # Multiplicative Utility Score
         final_score = correctness * 1.0 * latency_score * freshness * safety

@@ -91,7 +91,7 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
                 "rationale": score_breakdown.rationale
             }
             evaluations.append(eval_entry)
-            if score_breakdown.status in ("ELIGIBLE", "WARNING") and score_breakdown.final_score > 0.0:
+            if score_breakdown.status == "ELIGIBLE" and score_breakdown.final_score > 0.0:
                 scored_candidates.append((score_breakdown.final_score, cand, score_breakdown))
 
         # Select highest-scoring eligible candidate
@@ -102,18 +102,29 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
             chosen_binary = best_cand["binary"]
             selection_rationale = f"COURT_VERIFIED_ROUTING: Selected {chosen_tool} with score {best_score:.4f} ({best_breakdown.rationale})"
         else:
-            # Check if any candidate has a certified superseded_by tool
+            # Check if any candidate has a certified superseded_by tool that is itself ELIGIBLE
             for ev in evaluations:
                 if ev.get("status") == "QUARANTINED" and "air10-orjson-tool" in ev.get("rationale", ""):
-                    chosen_tool = "air10-orjson-tool"
-                    chosen_binary = "/Users/rajondas/.local/bin/air10-orjson-tool"
-                    selection_rationale = f"ENFORCED_FALLBACK: Candidate quarantined. Routed to certified supersede: {chosen_tool}."
-                    break
+                    sup_score = ranker.score_tool(
+                        tool_name="air10-orjson-tool",
+                        capability=required_capability,
+                        input_format=input_format,
+                        contract_version=contract_version,
+                        binary_path="/Users/rajondas/.local/bin/air10-orjson-tool",
+                        observed_latency_ms=1.5,
+                        is_supervised=True
+                    )
+                    if sup_score.status == "ELIGIBLE" and sup_score.final_score > 0.0:
+                        chosen_tool = "air10-orjson-tool"
+                        chosen_binary = "/Users/rajondas/.local/bin/air10-orjson-tool"
+                        selection_rationale = f"ENFORCED_FALLBACK: Candidate quarantined. Routed to verified supersede: {chosen_tool} (score {sup_score.final_score:.4f})."
+                        break
 
-    if not chosen_tool and candidates:
-        chosen_tool = candidates[0].get("name")
-        chosen_binary = candidates[0].get("binary")
-        selection_rationale = "FALLBACK_UNRANKED"
+    # STRICT FAIL-CLOSED INVARIANT: NO FALLBACK_UNRANKED!
+    if not chosen_tool:
+        chosen_tool = None
+        chosen_binary = None
+        selection_rationale = "NO_VERIFIED_TOOL_AVAILABLE: All candidate tools held, quarantined, or unverified by Court"
 
     # 3. Correlation payload & hash
     details = {

@@ -15,9 +15,13 @@ for local execution and remote GitHub Actions CI matrix:
 9. NDJSON Corrupted Stream Fail-Closed Proof
 10. Bridge Zero-Score Hard Exclusion from Routable Output
 11. Bridge Ranker Initialization Failure Hard Refusal
+12. Layer 2 Router Fail-Closed Hold on Unverified Candidates
+13. C11 Execution Boundary Physical Supervision Parity
 """
 
 import hashlib
+import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -143,6 +147,22 @@ def test_gate1_pristine_baseline(hermetic_audit_db, mock_binaries):
             ?, ?, 'Verified in court canary', NULL, NULL, '2026-09-11T00:00:00Z', 'CANARY_PASS'
         )
     """, (mock_binaries["valid_path"], mock_binaries["valid_sha"]))
+
+    conn.execute("""
+        INSERT INTO tool_traces_v2 VALUES (
+            'tr_gate1_pristine', 'CANONICAL_TEST', 'INTERACTIVE', '[]',
+            'test-valid-tool', ?, ?, '/tmp/in', 'sha_in', 'sha_out',
+            0, 4.5, 'EQUIVALENT', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z'
+        )
+    """, (mock_binaries["valid_path"], mock_binaries["valid_sha"]))
+
+    conn.execute("""
+        INSERT INTO trace_events VALUES (
+            NULL, 'tr_gate1_pristine', 'span_01', 'span_root',
+            'PROCESS_EXECUTION', 'civex_executor', '2026-09-11T00:00:00Z',
+            'sha_payload', 'COMPLETED', ?
+        )
+    """, (json.dumps({"tool_name": "test-valid-tool", "binary_path": mock_binaries["valid_path"]}),))
     conn.commit()
     conn.close()
 
@@ -390,3 +410,85 @@ def test_gate11_bridge_ranker_init_failure(tmp_path):
     assert res["status"] == "VERIFICATION_UNAVAILABLE_HOLD"
     assert res["tools"] == []
     assert "FAIL-CLOSED" in res["error"]
+
+
+def test_gate12_layer2_router_fail_closed(hermetic_audit_db, monkeypatch):
+    """Gate 12: Layer 2 router MUST strictly fail-closed when candidates are unverified, returning None."""
+    from civex.trace_plumbing import air10_layer2_router
+    monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUTO_TRIGGER_BIN", "/non/existent/trigger")
+
+    chosen_tool, chosen_bin, span_id = air10_layer2_router.route_intent(
+        trace_id="tr_gate12_router_fail",
+        parent_span_id="span_root_gate12",
+        intent_query="test parse json strict"
+    )
+    assert chosen_tool is None
+    assert chosen_bin is None
+    assert span_id.startswith("span_router_")
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    cur = conn.cursor()
+    cur.execute("SELECT stage, producer, status, details_json FROM trace_events WHERE trace_id = 'tr_gate12_router_fail'")
+    row = cur.fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "ROUTER_EVALUATION"
+    assert row[1] == "civex-court-router"
+    assert row[2] == "EVALUATED"
+    details = json.loads(row[3])
+    assert details["chosen_tool"] is None
+    assert "NO_VERIFIED_TOOL_AVAILABLE" in details["selection_rationale"]
+
+
+def test_gate13_c11_execution_boundary_integration(tmp_path):
+    """Gate 13: Compile C11 execution boundary and verify physical process execution supervision."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    c_source = os.path.join(repo_root, "civex", "trace_plumbing", "air10_exec_boundary.c")
+    assert os.path.isfile(c_source), f"C11 supervisor source missing at {c_source}"
+
+    boundary_bin = str(tmp_path / "test_exec_boundary")
+    compile_cmd = ["cc", "-O3", "-std=c11", c_source, "-o", boundary_bin]
+    comp = subprocess.run(compile_cmd, capture_output=True, text=True)
+    assert comp.returncode == 0, f"C11 compilation failed: {comp.stderr}"
+    assert os.path.isfile(boundary_bin)
+
+    input_file = str(tmp_path / "input.txt")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write("test input content\n")
+
+    # 1. Successful execution
+    worker_script = str(tmp_path / "worker.sh")
+    with open(worker_script, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'TEST_SUPERVISED_OUTPUT'\nexit 0\n")
+    os.chmod(worker_script, 0o755)
+
+    proc = subprocess.run(
+        [boundary_bin, "tr_gate13_exec", "span_root", worker_script, input_file],
+        capture_output=True,
+        text=True
+    )
+    assert proc.returncode == 0
+    telemetry = json.loads(proc.stdout)
+    assert telemetry["trace_id"] == "tr_gate13_exec"
+    assert telemetry["exit_code"] == 0
+    assert telemetry["wall_duration_ms"] >= 0.0
+    assert telemetry["supervisor"] == "air10_exec_boundary_c11"
+    expected_sha = hashlib.sha256(b"TEST_SUPERVISED_OUTPUT").hexdigest()
+    assert telemetry["stdout_sha256"] == expected_sha
+
+    # 2. Failing execution with non-zero exit code
+    failing_script = str(tmp_path / "failing_worker.sh")
+    with open(failing_script, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'FAILURE_OUTPUT'\nexit 42\n")
+    os.chmod(failing_script, 0o755)
+
+    proc_fail = subprocess.run(
+        [boundary_bin, "tr_gate13_fail", "span_root", failing_script, input_file],
+        capture_output=True,
+        text=True
+    )
+    assert proc_fail.returncode == 42
+    fail_telemetry = json.loads(proc_fail.stdout)
+    assert fail_telemetry["exit_code"] == 42
+    assert fail_telemetry["stdout_sha256"] == hashlib.sha256(b"FAILURE_OUTPUT").hexdigest()

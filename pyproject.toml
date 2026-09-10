@@ -40,4 +40,8 @@ where = ["."]
 include = ["civex*"]
 
 [tool.setuptools.package-data]
-civex = ["data/*.sqlite"]
+civex = [
+    "data/*.sqlite",
+    "trace_plumbing/*.c",
+    "trace_plumbing/*.py"
+]

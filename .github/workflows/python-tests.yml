@@ -29,6 +29,12 @@ jobs:
         pip install pytest pytest-asyncio
         pip install -e .
 
+    - name: Compile & Smoke Test C11 Execution Boundary
+      run: |
+        cc -O3 -std=c11 civex/trace_plumbing/air10_exec_boundary.c -o /tmp/air10_exec_boundary
+        chmod +x /tmp/air10_exec_boundary
+        /tmp/air10_exec_boundary "tr_ci_smoke" "span_root" /bin/echo /dev/null
+
     - name: Run Master Regression Suite
       run: |
         pytest tests/

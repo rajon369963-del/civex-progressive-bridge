@@ -30,6 +30,42 @@ def hermetic_court_env(tmp_path):
         );
     """)
 
+    cur.execute("""
+        CREATE TABLE tool_traces_v2 (
+            trace_id TEXT PRIMARY KEY,
+            task_intent TEXT NOT NULL,
+            traffic_class TEXT NOT NULL,
+            router_candidates TEXT NOT NULL,
+            chosen_tool TEXT NOT NULL,
+            binary_path TEXT NOT NULL,
+            binary_sha256 TEXT NOT NULL,
+            input_path TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            stdout_sha256 TEXT NOT NULL,
+            actual_exit_code INTEGER NOT NULL,
+            duration_ms REAL NOT NULL,
+            semantic_equivalence TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            failure_reason TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE trace_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            span_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            stage TEXT NOT NULL,
+            producer TEXT NOT NULL,
+            timestamp_iso TEXT NOT NULL,
+            payload_sha256 TEXT,
+            status TEXT NOT NULL,
+            details_json TEXT NOT NULL
+        );
+    """)
+
     # Create dummy binaries
     bin_ok = tmp_path / "bin_ok.sh"
     bin_ok.write_text("#!/bin/sh\necho ok\n")
@@ -47,11 +83,11 @@ def hermetic_court_env(tmp_path):
     # Seed contract rows
     cur.execute("""
         INSERT INTO tool_contract_verdicts_v2 VALUES
-        ('tool_quarantined', 'JSON_STRICT', 'RFC8259', 'v1.0', 'QUARANTINED', ?, ?, 'Truncation flaw', '2026-09-10', 'tool_ok', '2026-09-10', 'EVIDENCE_GATE_1'),
-        ('tool_warning', 'JSON_LENIENT', 'STREAM_PREFIX', 'v1.0', 'ALLOWED_WITH_WARNING', ?, ?, 'Prefix only', NULL, NULL, '2026-09-10', 'EVIDENCE_GATE_2'),
-        ('tool_ok', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, ?, 'Full RFC 8259 verified', NULL, NULL, '2026-09-10', 'EVIDENCE_GATE_3'),
-        ('tool_tampered', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, 'certified_expected_sha_123', 'Attested binary', NULL, NULL, '2026-09-10', 'EVIDENCE_GATE_4'),
-        ('tool_noexec', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, ?, 'Lacks exec bit', NULL, NULL, '2026-09-10', 'EVIDENCE_GATE_5');
+        ('tool_quarantined', 'JSON_STRICT', 'RFC8259', 'v1.0', 'QUARANTINED', ?, ?, 'Truncation flaw', '2026-09-10T00:00:00Z', 'tool_ok', '2026-09-10T00:00:00Z', 'EVIDENCE_GATE_1'),
+        ('tool_warning', 'JSON_LENIENT', 'STREAM_PREFIX', 'v1.0', 'ALLOWED_WITH_WARNING', ?, ?, 'Prefix only', NULL, NULL, '2026-09-10T00:00:00Z', 'EVIDENCE_GATE_2'),
+        ('tool_ok', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, ?, 'Full RFC 8259 verified', NULL, NULL, '2026-09-10T00:00:00Z', 'EVIDENCE_GATE_3'),
+        ('tool_tampered', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, 'certified_expected_sha_123', 'Attested binary', NULL, NULL, '2026-09-10T00:00:00Z', 'EVIDENCE_GATE_4'),
+        ('tool_noexec', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, ?, 'Lacks exec bit', NULL, NULL, '2026-09-10T00:00:00Z', 'EVIDENCE_GATE_5');
     """, (
         str(bin_ok), sha_ok,
         str(bin_ok), sha_ok,
@@ -59,6 +95,19 @@ def hermetic_court_env(tmp_path):
         str(bin_tampered),
         str(bin_noexec), hashlib.sha256(bin_noexec.read_bytes()).hexdigest()
     ))
+
+    # Seed empirical traces and supervision events for tool_ok and tool_warning
+    cur.execute("""
+        INSERT INTO tool_traces_v2 VALUES
+        ('tr_mock_ok', 'INTENT_TEST', 'BATCH', '[]', 'tool_ok', ?, ?, '/tmp/in', 'in_sha', 'out_sha', 0, 5.0, 'EQUIVALENT', 'VERIFIED_PASS', NULL, '2026-09-10T00:00:00Z'),
+        ('tr_mock_warn', 'INTENT_TEST', 'BATCH', '[]', 'tool_warning', ?, ?, '/tmp/in', 'in_sha', 'out_sha', 0, 10.0, 'EQUIVALENT', 'VERIFIED_PASS', NULL, '2026-09-10T00:00:00Z');
+    """, (str(bin_ok), sha_ok, str(bin_ok), sha_ok))
+
+    cur.execute("""
+        INSERT INTO trace_events VALUES
+        (NULL, 'tr_mock_ok', 'span_01', 'span_root', 'PROCESS_EXECUTION', 'civex_exec', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_ok", "tool_id": "tool_ok"}'),
+        (NULL, 'tr_mock_warn', 'span_02', 'span_root', 'PROCESS_EXECUTION', 'civex_exec', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "tool_warning", "tool_id": "tool_warning"}');
+    """)
     conn.commit()
     conn.close()
 

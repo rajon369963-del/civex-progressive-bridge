@@ -47,12 +47,9 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
             duration_us = duration_ms * 1000.0
             stdout_sha256 = boundary_data["stdout_sha256"]
             supervisor_name = boundary_data.get("supervisor", "air10_exec_boundary_c11")
-        except Exception:
-            actual_returncode = proc.returncode
-            duration_ms = 10.0
-            duration_us = 10000.0
-            stdout_sha256 = hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
-            supervisor_name = "air10_exec_boundary_fallback"
+        except Exception as e:
+            sys.stderr.write(f"C11_BOUNDARY_PARSE_ERROR: Failed to parse boundary json from stdout: {e}. Output: {proc.stdout[:200]}\n")
+            raise RuntimeError(f"FAIL-CLOSED: C11 supervisor boundary output parse error: {e}") from e
         stdout_preview = proc.stdout[:200]
         stderr_preview = proc.stderr[:200]
     else:

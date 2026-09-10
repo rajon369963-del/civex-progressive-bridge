@@ -22,12 +22,15 @@ def shim_intercept(trace_id, tool_name, binary_path, command_args, parent_span_i
 
     # 1. Correlated physical append to shim_intercept.log if directory exists
     try:
-        if os.path.isdir(os.path.dirname(SHIM_LOG)):
-            shim_entry = f"[{now_iso}] PID:{pid} TRACE:{trace_id} PARENT:{effective_parent or 'NONE'} SHIM:{tool_name} BIN:{binary_path} ARGS:{command_args}\n"
-            with open(SHIM_LOG, "a", encoding="utf-8") as f:
-                f.write(shim_entry)
-    except Exception:
-        pass
+        log_dir = os.path.dirname(SHIM_LOG)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        shim_entry = f"[{now_iso}] PID:{pid} TRACE:{trace_id} PARENT:{effective_parent or 'NONE'} SHIM:{tool_name} BIN:{binary_path} ARGS:{command_args}\n"
+        with open(SHIM_LOG, "a", encoding="utf-8") as f:
+            f.write(shim_entry)
+    except Exception as e:
+        sys.stderr.write(f"SHIM_LOG_FAILURE: Unable to append to {SHIM_LOG}: {e}\n")
+        raise RuntimeError(f"FAIL-CLOSED: Shim log write failure: {e}") from e
 
     # 2. Compute binary SHA-256 if file exists
     bin_sha256 = "UNKNOWN"
