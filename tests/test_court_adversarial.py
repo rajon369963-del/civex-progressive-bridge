@@ -492,3 +492,201 @@ def test_gate13_c11_execution_boundary_integration(tmp_path):
     fail_telemetry = json.loads(proc_fail.stdout)
     assert fail_telemetry["exit_code"] == 42
     assert fail_telemetry["stdout_sha256"] == hashlib.sha256(b"FAILURE_OUTPUT").hexdigest()
+
+
+def test_gate14_circuit_breaker_feedback_loop(tmp_path):
+    """Gate 14: Verify end-to-end circuit breaker trips after 3 failures and forces rerouting."""
+    from civex.bridge import CIVeXVerifier
+    state_file = str(tmp_path / "cb_state.json")
+
+    orig_state_file = CIVeXVerifier.STATE_FILE
+    CIVeXVerifier.STATE_FILE = state_file
+    try:
+        verifier = CIVeXVerifier()
+        tool_id = "test_failing_tool"
+
+        assert not verifier.is_circuit_open(tool_id)
+
+        verifier.record_outcome(tool_id, success=False, error_msg="Error 1")
+        verifier.record_outcome(tool_id, success=False, error_msg="Error 2")
+        assert not verifier.is_circuit_open(tool_id)
+
+        verifier.record_outcome(tool_id, success=False, error_msg="Error 3")
+        assert verifier.is_circuit_open(tool_id)
+
+        verifier.record_outcome(tool_id, success=True)
+        assert not verifier.is_circuit_open(tool_id)
+    finally:
+        CIVeXVerifier.STATE_FILE = orig_state_file
+
+
+def test_gate15_toctou_input_integrity_mismatch_fail_closed(hermetic_audit_db, tmp_path):
+    """Gate 15: TOCTOU mutation between execution and verification triggers fail-closed violation."""
+    from civex.trace_plumbing.air10_layer5_verifier import verify_trace
+
+    input_file = str(tmp_path / "input.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"test": "original"}')
+    orig_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    trace_id = "tr_gate15_toctou"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events 
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_01', 'span_root', 'PROCESS_EXECUTION', 'c11_supervisor', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (trace_id, json.dumps({
+        "binary_path": "/bin/echo",
+        "binary_sha256": "0" * 64,
+        "input_file": input_file,
+        "input_sha256": orig_sha,
+        "actual_returncode": 0,
+        "duration_ms": 1.0,
+        "stdout_sha256": "0" * 64
+    })))
+    conn.commit()
+    conn.close()
+
+    # Mutate input file on disk before Layer 5 runs (TOCTOU mutation attack)
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"test": "TAMPERED_CONTENT"}')
+
+    os.environ["AIR10_AUDIT_DB"] = hermetic_audit_db
+    verdict = verify_trace(trace_id, target_stdout_file=None, audit_db_path=hermetic_audit_db)
+    assert verdict == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    cur = conn.cursor()
+    cur.execute("SELECT details_json FROM trace_events WHERE trace_id = ? AND stage = 'INDEPENDENT_VERIFICATION'", (trace_id,))
+    row = cur.fetchone()
+    conn.close()
+    assert row is not None
+    details = json.loads(row[0])
+    assert details["semantic_result"] == "TOCTOU_INTEGRITY_VIOLATION"
+    assert "TOCTOU_MUTATION_DETECTED" in details["failure_reason"]
+
+
+def test_gate16_strict_rfc8259_number_constants_rejection():
+    """Gate 16: Strict RFC 8259 Section 6 requires rejection of NaN, Infinity, -Infinity."""
+    from civex.trace_plumbing.air10_layer5_verifier import inspect_strict_rfc8259
+
+    # 1. NaN rejection
+    valid, obj, trailing, sample = inspect_strict_rfc8259(b'{"key": NaN}')
+    assert not valid
+    assert "RFC 8259 Section 6 violation" in sample or "JSON_SYNTAX_ERROR" in sample
+
+    # 2. Infinity rejection
+    valid, obj, trailing, sample = inspect_strict_rfc8259(b'{"key": Infinity}')
+    assert not valid
+    assert "RFC 8259 Section 6 violation" in sample or "JSON_SYNTAX_ERROR" in sample
+
+    # 3. -Infinity rejection
+    valid, obj, trailing, sample = inspect_strict_rfc8259(b'{"key": -Infinity}')
+    assert not valid
+    assert "RFC 8259 Section 6 violation" in sample or "JSON_SYNTAX_ERROR" in sample
+
+    # 4. Standard numbers must be accepted
+    valid, obj, trailing, sample = inspect_strict_rfc8259(b'{"key": 42.125e-3}')
+    assert valid
+    assert obj == {"key": 0.042125}
+    assert not trailing
+
+
+def test_gate17_c11_stdout_preservation_and_arbitrary_argv(tmp_path):
+    """Gate 17: C11 execution boundary persists stdout to file and supports arbitrary argv."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    c_source = os.path.join(repo_root, "civex", "trace_plumbing", "air10_exec_boundary.c")
+    boundary_bin = str(tmp_path / "test_exec_boundary_v2")
+
+    comp = subprocess.run(["cc", "-O3", "-std=c11", c_source, "-o", boundary_bin], capture_output=True, text=True)
+    assert comp.returncode == 0
+
+    # Create worker script that accepts 3 arbitrary arguments and prints them
+    worker_script = str(tmp_path / "multi_arg_worker.sh")
+    with open(worker_script, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nprintf "ARG1=%s|ARG2=%s|ARG3=%s" "$1" "$2" "$3"\nexit 0\n')
+    os.chmod(worker_script, 0o755)
+
+    captured_stdout_file = str(tmp_path / "captured_child_stdout.txt")
+    env = os.environ.copy()
+    env["AIR10_STDOUT_CAPTURE_PATH"] = captured_stdout_file
+
+    proc = subprocess.run(
+        [boundary_bin, "tr_gate17", "span_root", worker_script, "alpha", "bravo", "charlie"],
+        capture_output=True, text=True, env=env
+    )
+    assert proc.returncode == 0
+    telemetry = json.loads(proc.stdout)
+    assert telemetry["exit_code"] == 0
+
+    expected_output = b"ARG1=alpha|ARG2=bravo|ARG3=charlie"
+    expected_sha = hashlib.sha256(expected_output).hexdigest()
+    assert telemetry["stdout_sha256"] == expected_sha
+
+    # Assert physical stdout file was preserved and matches exact bytes
+    assert os.path.isfile(captured_stdout_file)
+    with open(captured_stdout_file, "rb") as cf:
+        captured_bytes = cf.read()
+    assert captured_bytes == expected_output
+    assert hashlib.sha256(captured_bytes).hexdigest() == expected_sha
+
+
+def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_path):
+    """Gate 18: tool_traces_v2 must store physical 64-char SHA-256 digests, zero placeholder strings."""
+    import re
+
+    from civex.trace_plumbing.air10_layer5_verifier import verify_trace
+
+    input_file = str(tmp_path / "valid_doc.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"status": "ok"}')
+    in_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    stdout_file = str(tmp_path / "valid_stdout.json")
+    with open(stdout_file, "w", encoding="utf-8") as f:
+        f.write('{"status": "ok"}')
+    out_sha = hashlib.sha256(open(stdout_file, "rb").read()).hexdigest()
+
+    trace_id = "tr_gate18_digest"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events 
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g18', 'span_root', 'PROCESS_EXECUTION', 'c11_supervisor', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (trace_id, json.dumps({
+        "binary_path": "/bin/echo",
+        "binary_sha256": "1" * 64,
+        "input_file": input_file,
+        "input_sha256": in_sha,
+        "actual_returncode": 0,
+        "duration_ms": 1.5,
+        "stdout_sha256": out_sha,
+        "output_file": stdout_file
+    })))
+    conn.commit()
+    conn.close()
+
+    os.environ["AIR10_AUDIT_DB"] = hermetic_audit_db
+    verdict = verify_trace(trace_id, target_stdout_file=stdout_file, audit_db_path=hermetic_audit_db)
+    assert verdict == "VERIFIED_PASS"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (trace_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    assert row is not None
+    sha_regex = re.compile(r"^[0-9a-fA-F]{64}$")
+
+    # Assert binary_sha256 is genuine 64-char hex, NOT 'BOUNDARY_INTERCEPTED'
+    assert row["binary_sha256"] != "BOUNDARY_INTERCEPTED"
+    assert len(row["binary_sha256"]) == 64
+    assert sha_regex.match(row["binary_sha256"]) is not None
+
+    # Assert stdout_sha256 is genuine 64-char hex, NOT 'STDOUT_RECORDED'
+    assert row["stdout_sha256"] != "STDOUT_RECORDED"
+    assert len(row["stdout_sha256"]) == 64
+    assert sha_regex.match(row["stdout_sha256"]) is not None
+    assert row["stdout_sha256"] == out_sha

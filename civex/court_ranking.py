@@ -43,6 +43,7 @@ class ToolScoreBreakdown:
     status: str  # 'ELIGIBLE', 'QUARANTINED', 'CIRCUIT_OPEN', 'WARNING', 'CONTRACT_UNVERIFIED', 'BINARY_TAMPERED', 'VERIFICATION_UNAVAILABLE_HOLD', 'CIRCUIT_STATE_UNKNOWN_HOLD'
     rationale: str
     binary_sha256: str | None = None
+    superseded_by: str | None = None
 
 
 class CourtAwareRanker:
@@ -270,7 +271,8 @@ class CourtAwareRanker:
                     safety=0.0,
                     final_score=0.0,
                     status="QUARANTINED",
-                    rationale=f"HARD_EXCLUSION: Quarantined ({q_reason}). Superseded by {superseded_by}."
+                    rationale=f"HARD_EXCLUSION: Quarantined ({q_reason}). Superseded by {superseded_by}.",
+                    superseded_by=superseded_by
                 )
             elif q_status == "ALLOWED_WITH_WARNING":
                 correctness = 0.70
@@ -453,7 +455,8 @@ class CourtAwareRanker:
             final_score=round(final_score, 6),
             status=status,
             rationale=rationale,
-            binary_sha256=actual_bin_sha or certified_sha
+            binary_sha256=actual_bin_sha or certified_sha,
+            superseded_by=superseded_by
         )
 
     def rank_candidates(

@@ -45,3 +45,6 @@ civex = [
     "trace_plumbing/*.c",
     "trace_plumbing/*.py"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

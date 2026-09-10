@@ -17,10 +17,13 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
 
-def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
+def execute_process(trace_id, binary_path, input_file, parent_span_id=None, output_file=None):
     span_id = f"span_exec_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
+
+    if not output_file:
+        output_file = f"/tmp/air10_stdout_{trace_id}_{span_id}.out"
 
     # 1. Compute input file SHA-256
     with open(input_file, "rb") as f:
@@ -35,10 +38,16 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
             bin_sha256 = hashlib.sha256(f.read()).hexdigest()
 
     # 3. Supervised Execution (Prefer native C11 exec boundary)
+    env = os.environ.copy()
+    env["AIR10_TRACE_ID"] = trace_id
+    env["AIR10_STDOUT_CAPTURE_PATH"] = output_file
+    if effective_parent:
+        env["AIR10_PARENT_SPAN_ID"] = effective_parent
+
     if os.path.isfile(SUPERVISOR_BIN) and os.access(SUPERVISOR_BIN, os.X_OK):
         proc = subprocess.run(
             [SUPERVISOR_BIN, trace_id, effective_parent or "root", binary_path, input_file],
-            capture_output=True, text=True
+            capture_output=True, text=True, env=env
         )
         try:
             boundary_data = json.loads(proc.stdout)
@@ -54,11 +63,6 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
         stderr_preview = proc.stderr[:200]
     else:
         # High-resolution clock python fallback
-        env = os.environ.copy()
-        env["AIR10_TRACE_ID"] = trace_id
-        if effective_parent:
-            env["AIR10_PARENT_SPAN_ID"] = effective_parent
-
         t_start = time.perf_counter_ns()
         p = subprocess.run([binary_path, input_file], capture_output=True, env=env)
         t_end = time.perf_counter_ns()
@@ -69,6 +73,8 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
 
         stdout_raw = p.stdout
         stderr_raw = p.stderr
+        with open(output_file, "wb") as of:
+            of.write(stdout_raw)
         stdout_sha256 = hashlib.sha256(stdout_raw).hexdigest()
         stdout_preview = stdout_raw.decode("utf-8", errors="replace")[:200]
         stderr_preview = stderr_raw.decode("utf-8", errors="replace")[:200]
@@ -80,6 +86,7 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None):
         "input_file": input_file,
         "input_size_bytes": input_size,
         "input_sha256": input_sha256,
+        "output_file": output_file,
         "actual_returncode": actual_returncode,
         "duration_us": duration_us,
         "duration_ms": duration_ms,

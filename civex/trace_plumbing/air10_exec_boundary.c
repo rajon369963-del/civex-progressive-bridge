@@ -121,28 +121,41 @@ static double timespec_to_ms(struct timespec ts) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <TRACE_ID> <PARENT_SPAN_ID> <BINARY_PATH> <INPUT_FILE>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <TRACE_ID> <PARENT_SPAN_ID> <BINARY_PATH> [ARGS...]\n", argv[0]);
         return 1;
     }
 
     const char *trace_id = argv[1];
     const char *parent_span_id = argv[2];
     const char *binary_path = argv[3];
-    const char *input_file = argv[4];
+    const char *input_file = (argc > 4) ? argv[4] : "";
 
     if (access(binary_path, X_OK) != 0) {
         fprintf(stderr, "ERROR: Binary '%s' not found or not executable\n", binary_path);
         return 126;
     }
-    if (access(input_file, R_OK) != 0) {
-        fprintf(stderr, "ERROR: Input file '%s' not readable\n", input_file);
-        return 127;
+    if (argc > 4 && strlen(input_file) > 0 && access(input_file, R_OK) != 0) {
+        if (access(input_file, F_OK) == 0) {
+            fprintf(stderr, "ERROR: Input file '%s' not readable\n", input_file);
+            return 127;
+        }
+    }
+
+    /* Optional stdout preservation path from environment */
+    const char *capture_path = getenv("AIR10_STDOUT_CAPTURE_PATH");
+    int capture_fd = -1;
+    if (capture_path && capture_path[0] != '\0') {
+        capture_fd = open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (capture_fd < 0) {
+            fprintf(stderr, "WARNING: Could not open AIR10_STDOUT_CAPTURE_PATH '%s' for writing\n", capture_path);
+        }
     }
 
     int pipe_out[2];
     if (pipe(pipe_out) != 0) {
         perror("pipe");
+        if (capture_fd >= 0) close(capture_fd);
         return 1;
     }
 
@@ -152,6 +165,7 @@ int main(int argc, char *argv[]) {
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        if (capture_fd >= 0) close(capture_fd);
         return 1;
     }
 
@@ -160,13 +174,26 @@ int main(int argc, char *argv[]) {
         close(pipe_out[0]);
         dup2(pipe_out[1], STDOUT_FILENO);
         close(pipe_out[1]);
+        if (capture_fd >= 0) close(capture_fd);
 
         /* Set environment */
         setenv("AIR10_TRACE_ID", trace_id, 1);
         setenv("AIR10_PARENT_SPAN_ID", parent_span_id, 1);
 
-        char *args[] = { (char *)binary_path, (char *)input_file, NULL };
-        execv(binary_path, args);
+        /* Build arbitrary argv: child_args[0] = binary_path, child_args[1..] = argv[4..], NULL */
+        int child_argc = argc - 3;
+        char **child_args = (char **)malloc(sizeof(char *) * (child_argc + 1));
+        if (!child_args) {
+            perror("malloc");
+            _exit(127);
+        }
+        child_args[0] = (char *)binary_path;
+        for (int i = 4; i < argc; i++) {
+            child_args[i - 3] = argv[i];
+        }
+        child_args[child_argc] = NULL;
+
+        execv(binary_path, child_args);
 
         /* If execv fails */
         perror("execv");
@@ -185,8 +212,15 @@ int main(int argc, char *argv[]) {
     while ((bytes_read = read(pipe_out[0], buffer, sizeof(buffer))) > 0) {
         sha256_update(&ctx, buffer, bytes_read);
         total_stdout_bytes += bytes_read;
+        if (capture_fd >= 0) {
+            ssize_t written = write(capture_fd, buffer, bytes_read);
+            (void)written;
+        }
     }
     close(pipe_out[0]);
+    if (capture_fd >= 0) {
+        close(capture_fd);
+    }
 
     uint8_t hash[32];
     sha256_final(&ctx, hash);
@@ -222,6 +256,7 @@ int main(int argc, char *argv[]) {
     printf("  \"max_rss_kb\": %ld,\n", max_rss);
     printf("  \"stdout_bytes\": %zu,\n", total_stdout_bytes);
     printf("  \"stdout_sha256\": \"%s\",\n", stdout_sha256);
+    printf("  \"stdout_capture_path\": \"%s\",\n", capture_path ? capture_path : "");
     printf("  \"supervisor\": \"air10_exec_boundary_c11\"\n");
     printf("}\n");
 

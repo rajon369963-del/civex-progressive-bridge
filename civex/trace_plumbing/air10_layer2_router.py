@@ -88,7 +88,8 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
                 "contract_version": contract_version,
                 "status": score_breakdown.status,
                 "score": score_breakdown.final_score,
-                "rationale": score_breakdown.rationale
+                "rationale": score_breakdown.rationale,
+                "superseded_by": score_breakdown.superseded_by
             }
             evaluations.append(eval_entry)
             if score_breakdown.status == "ELIGIBLE" and score_breakdown.final_score > 0.0:
@@ -102,21 +103,40 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
             chosen_binary = best_cand["binary"]
             selection_rationale = f"COURT_VERIFIED_ROUTING: Selected {chosen_tool} with score {best_score:.4f} ({best_breakdown.rationale})"
         else:
-            # Check if any candidate has a certified superseded_by tool that is itself ELIGIBLE
+            # Dynamic superseded_by resolution (Zero synthetic constants, pure Court contract truth)
             for ev in evaluations:
-                if ev.get("status") == "QUARANTINED" and "air10-orjson-tool" in ev.get("rationale", ""):
+                sup_tool = ev.get("superseded_by")
+                if ev.get("status") == "QUARANTINED" and sup_tool:
+                    sup_bin = None
+                    for cand in candidate_tools:
+                        if cand.get("name") == sup_tool:
+                            sup_bin = cand.get("binary")
+                            break
+                    if not sup_bin:
+                        sup_bin = shutil.which(sup_tool) or f"/Users/rajondas/.local/bin/{sup_tool}"
+
+                    # Strict empirical scoring path with canonical tool_id
                     sup_score = ranker.score_tool(
-                        tool_name="air10-orjson-tool",
+                        tool_name=sup_tool,
                         capability=required_capability,
                         input_format=input_format,
                         contract_version=contract_version,
-                        binary_path="/Users/rajondas/.local/bin/air10-orjson-tool",
-                        observed_latency_ms=1.5,
-                        is_supervised=True
+                        binary_path=sup_bin,
+                        tool_id=sup_tool
                     )
+                    evaluations.append({
+                        "candidate": sup_tool,
+                        "capability": required_capability,
+                        "input_format": input_format,
+                        "contract_version": contract_version,
+                        "status": sup_score.status,
+                        "score": sup_score.final_score,
+                        "rationale": sup_score.rationale,
+                        "superseded_by": sup_score.superseded_by
+                    })
                     if sup_score.status == "ELIGIBLE" and sup_score.final_score > 0.0:
-                        chosen_tool = "air10-orjson-tool"
-                        chosen_binary = "/Users/rajondas/.local/bin/air10-orjson-tool"
+                        chosen_tool = sup_tool
+                        chosen_binary = sup_bin
                         selection_rationale = f"ENFORCED_FALLBACK: Candidate quarantined. Routed to verified supersede: {chosen_tool} (score {sup_score.final_score:.4f})."
                         break
 
