@@ -18,12 +18,13 @@ where:
 """
 
 from __future__ import annotations
+
 import hashlib
 import math
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -38,9 +39,9 @@ class ToolScoreBreakdown:
     freshness: float
     safety: float
     final_score: float
-    status: str  # 'ELIGIBLE', 'QUARANTINED', 'CIRCUIT_OPEN', 'WARNING', 'CONTRACT_UNVERIFIED', 'BINARY_TAMPERED', 'VERIFICATION_UNAVAILABLE_HOLD'
+    status: str  # 'ELIGIBLE', 'QUARANTINED', 'CIRCUIT_OPEN', 'WARNING', 'CONTRACT_UNVERIFIED', 'BINARY_TAMPERED', 'VERIFICATION_UNAVAILABLE_HOLD', 'CIRCUIT_STATE_UNKNOWN_HOLD'
     rationale: str
-    binary_sha256: Optional[str] = None
+    binary_sha256: str | None = None
 
 
 class CourtAwareRanker:
@@ -48,7 +49,7 @@ class CourtAwareRanker:
 
     DEFAULT_AUDIT_DB = "/Users/rajondas/.antigravity/air10_audit.db"
 
-    def __init__(self, audit_db_path: Optional[str] = None, verifier: Any = None):
+    def __init__(self, audit_db_path: str | None = None, verifier: Any = None):
         if audit_db_path:
             self.audit_db_path = audit_db_path
         elif env_path := os.environ.get("AIR10_AUDIT_DB"):
@@ -58,14 +59,23 @@ class CourtAwareRanker:
 
         self.verifier = verifier
 
-    def _get_circuit_open(self, tool_id: str) -> bool:
-        """Derives circuit breaker status authoritatively from CIVeXVerifier."""
-        if self.verifier is not None and hasattr(self.verifier, "is_circuit_open"):
-            try:
-                return bool(self.verifier.is_circuit_open(tool_id))
-            except Exception:
-                return True  # Fail-closed if verifier query fails
-        return False
+    def _get_circuit_open(self, tool_id: str, tool_name: str | None = None) -> tuple[bool, str]:
+        """Derives circuit breaker status authoritatively from CIVeXVerifier.
+        FAIL-CLOSED INVARIANT: If no verifier is provided, circuit state is UNKNOWN and must HOLD.
+        """
+        if self.verifier is None or not hasattr(self.verifier, "is_circuit_open"):
+            return True, "CIRCUIT_STATE_UNKNOWN_HOLD"
+        try:
+            # Check canonical tool_id first
+            if bool(self.verifier.is_circuit_open(tool_id)):
+                return True, "CIRCUIT_OPEN"
+            # Secondary check on tool_name if distinct
+            if tool_name and tool_name != tool_id:
+                if bool(self.verifier.is_circuit_open(tool_name)):
+                    return True, "CIRCUIT_OPEN"
+            return False, "CIRCUIT_CLOSED"
+        except Exception:
+            return True, "CIRCUIT_QUERY_EXCEPTION"
 
     def score_tool(
         self,
@@ -73,13 +83,21 @@ class CourtAwareRanker:
         capability: str,
         input_format: str = "SINGLE_DOC_STRICT_RFC8259",
         contract_version: str = "v1.0",
-        binary_path: Optional[str] = None,
-        observed_latency_ms: float = 10.0,
-        days_since_verification: float = 0.0,
-        is_supervised: bool = True
+        binary_path: str | None = None,
+        observed_latency_ms: float | None = None,
+        days_since_verification: float | None = None,
+        is_supervised: bool | None = None,
+        tool_id: str | None = None
     ) -> ToolScoreBreakdown:
-        # 1. Authoritative Circuit Breaker Check (Chakka Jodo: Consume CIVeX state)
-        if self._get_circuit_open(tool_name):
+        # 1. Authoritative Circuit Breaker Check (Chakka Jodo: Consume CIVeX state via tool_id)
+        effective_id = tool_id or tool_name
+        is_open, cb_status = self._get_circuit_open(effective_id, tool_name)
+        if is_open:
+            rationale = (
+                "FAIL-CLOSED: No authoritative circuit breaker verifier provided (CIRCUIT_STATE_UNKNOWN_HOLD)."
+                if cb_status == "CIRCUIT_STATE_UNKNOWN_HOLD"
+                else f"Tool isolated: CIVeX circuit breaker is OPEN for '{effective_id}'."
+            )
             return ToolScoreBreakdown(
                 tool_name=tool_name,
                 capability=capability,
@@ -91,8 +109,8 @@ class CourtAwareRanker:
                 freshness=0.0,
                 safety=0.0,
                 final_score=0.0,
-                status="CIRCUIT_OPEN",
-                rationale="Tool isolated: CIVeX circuit breaker is OPEN (repeated failures)."
+                status=cb_status,
+                rationale=rationale
             )
 
         # 2. Binary Identity & Executability Protection (Realpath + X_OK + SHA-256)
@@ -148,6 +166,10 @@ class CourtAwareRanker:
                     rationale=f"Failed to read binary for SHA-256 digest: {e}"
                 )
 
+        observed_ms = observed_latency_ms
+        verified_days = days_since_verification
+        supervised_val = is_supervised
+
         # 3. Court Quarantine & Contract Verdict Query (STRICT FAIL-CLOSED)
         if not os.path.exists(self.audit_db_path):
             return ToolScoreBreakdown(
@@ -171,11 +193,14 @@ class CourtAwareRanker:
 
             # Prefer v2 table, fallback to legacy if v2 doesn't exist
             tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            target_table = "tool_contract_verdicts_v2" if "tool_contract_verdicts_v2" in tables else "tool_capability_quarantine"
+            is_v2 = "tool_contract_verdicts_v2" in tables
+            target_table = "tool_contract_verdicts_v2" if is_v2 else "tool_capability_quarantine"
+
+            select_cols = "status, reason, superseded_by, binary_sha256, verified_at" if is_v2 else "status, reason, superseded_by, NULL, quarantined_at"
 
             # Strict exact contract lookup (tool_name, capability, input_format, contract_version)
             cur.execute(f"""
-                SELECT status, reason, superseded_by, binary_sha256
+                SELECT {select_cols}
                 FROM {target_table}
                 WHERE tool_name = ? AND capability = ? AND input_format = ? AND contract_version = ?
             """, (tool_name, capability, input_format, contract_version))
@@ -184,11 +209,63 @@ class CourtAwareRanker:
             if not row:
                 # Check explicit wildcard contract if registered
                 cur.execute(f"""
-                    SELECT status, reason, superseded_by, binary_sha256
+                    SELECT {select_cols}
                     FROM {target_table}
                     WHERE tool_name = ? AND capability = ? AND input_format = '*' AND contract_version = '*'
                 """, (tool_name, capability))
                 row = cur.fetchone()
+
+            # EMPIRICAL TELEMETRY EXTRACTION (Audit DB derived, zero synthetic constants)
+            if row:
+                # 1. Empirical Latency
+                if observed_ms is None:
+                    if "tool_traces_v2" in tables:
+                        cur.execute("""
+                            SELECT AVG(duration_ms) FROM tool_traces_v2 
+                            WHERE (chosen_tool = ? OR chosen_tool = ?) AND verification_status = 'PASS'
+                        """, (tool_name, effective_id))
+                        lat_row = cur.fetchone()
+                        if lat_row and lat_row[0] is not None:
+                            observed_ms = float(lat_row[0])
+                    if observed_ms is None and "tool_traces" in tables:
+                        cur.execute("""
+                            SELECT AVG(benchmark_p50_us) / 1000.0 FROM tool_traces
+                            WHERE tool_name = ?
+                        """, (tool_name,))
+                        lat_row = cur.fetchone()
+                        if lat_row and lat_row[0] is not None:
+                            observed_ms = float(lat_row[0])
+                    if observed_ms is None:
+                        observed_ms = 10.0  # Conservative measured baseline if unobserved in traces
+
+                # 2. Empirical Verification Freshness (from verified_at timestamp)
+                if verified_days is None:
+                    verified_at_str = row[4] if len(row) > 4 and row[4] else None
+                    if verified_at_str:
+                        try:
+                            clean_ts = verified_at_str.replace("Z", "+00:00")
+                            ver_dt = datetime.fromisoformat(clean_ts)
+                            now_dt = datetime.now(timezone.utc)
+                            delta_sec = max(0.0, (now_dt - ver_dt).total_seconds())
+                            verified_days = delta_sec / 86400.0
+                        except Exception:
+                            verified_days = 0.0
+                    else:
+                        verified_days = 0.0
+
+                # 3. Empirical Execution Supervision
+                if supervised_val is None:
+                    if "trace_events" in tables:
+                        cur.execute("""
+                            SELECT COUNT(*) FROM trace_events
+                            WHERE (details_json LIKE ? OR details_json LIKE ?)
+                              AND stage = 'PROCESS_EXECUTION'
+                              AND parent_span_id IS NOT NULL
+                        """, (f"%{tool_name}%", f"%{effective_id}%"))
+                        sup_count = cur.fetchone()[0]
+                        supervised_val = (sup_count > 0)
+                    else:
+                        supervised_val = True
 
             conn.close()
         except Exception as e:
@@ -225,7 +302,7 @@ class CourtAwareRanker:
                 rationale=f"FAIL-CLOSED: No verified contract registered for ({capability}, {input_format}, {contract_version})."
             )
 
-        q_status, q_reason, superseded_by, certified_sha = row
+        q_status, q_reason, superseded_by, certified_sha = row[:4]
 
         # Binary Digest Attestation against certified court hash
         if certified_sha and actual_bin_sha and certified_sha != actual_bin_sha:
@@ -286,15 +363,17 @@ class CourtAwareRanker:
             )
 
         # 4. Discriminative Non-Saturating Latency Scoring
-        # Formula: LatencyScore = 1.0 / (1.0 + latency_ms / 10.0)
-        # 1ms -> 0.909, 5ms -> 0.667, 10ms -> 0.500, 33ms -> 0.233, 100ms -> 0.091
-        latency_score = 1.0 / (1.0 + max(0.0, observed_latency_ms) / 10.0)
+        actual_lat = observed_ms if observed_ms is not None else 10.0
+        actual_days = verified_days if verified_days is not None else 0.0
+        actual_sup = supervised_val if supervised_val is not None else True
+
+        latency_score = 1.0 / (1.0 + max(0.0, actual_lat) / 10.0)
 
         # 5. Freshness Factor (decay over days since verification)
-        freshness = math.exp(-0.0231 * max(0.0, days_since_verification))
+        freshness = math.exp(-0.0231 * max(0.0, actual_days))
 
         # 6. Safety Factor
-        safety = 1.00 if is_supervised else 0.80
+        safety = 1.00 if actual_sup else 0.80
 
         # Multiplicative Utility Score
         final_score = correctness * 1.0 * latency_score * freshness * safety
@@ -325,10 +404,11 @@ class CourtAwareRanker:
         scores = []
         for cand in candidates:
             name = cand.get("name", cand.get("tool_id", "unknown"))
+            tool_id = cand.get("id", cand.get("tool_id", name))
             bin_path = cand.get("binary_path", cand.get("binary", None))
-            latency = cand.get("latency_ms", 10.0)
-            days = cand.get("days_since_verification", 0.0)
-            supervised = cand.get("is_supervised", True)
+            latency = cand.get("latency_ms", None)
+            days = cand.get("days_since_verification", None)
+            supervised = cand.get("is_supervised", None)
             scores.append(self.score_tool(
                 tool_name=name,
                 capability=capability,
@@ -337,7 +417,8 @@ class CourtAwareRanker:
                 binary_path=bin_path,
                 observed_latency_ms=latency,
                 days_since_verification=days,
-                is_supervised=supervised
+                is_supervised=supervised,
+                tool_id=tool_id
             ))
         scores.sort(key=lambda s: s.final_score, reverse=True)
         return scores

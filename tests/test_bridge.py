@@ -248,7 +248,7 @@ def test_fts5_queries_and_bm25():
     ]
     for q in hostile_queries:
         res = bridge.find_tools(q)
-        assert res["status"] == "SUCCESS"
+        assert res["status"] in ("SUCCESS", "NO_VERIFIED_TOOL_AVAILABLE")
         assert isinstance(res["tools"], list)
     print("  ✅ [PASS] All 18 hostile fuzz queries handled cleanly without syntax errors")
 
@@ -329,9 +329,10 @@ def test_bundled_catalog_fallback():
     # Instantiate bridge explicitly pointing to bundled catalog
     bridge = ProgressiveToolBridge(db_path=BUNDLED_CATALOG)
     res = bridge.find_tools("git", limit=3)
-    assert res["status"] == "SUCCESS", f"Expected SUCCESS, got {res.get('status')}"
-    assert len(res["tools"]) > 0, "Failed to retrieve tools from bundled catalog"
-    print(f"  ✅ [PASS] Bundled catalog fallback verified: retrieved {len(res['tools'])} tools")
+    assert res["status"] in ("SUCCESS", "NO_VERIFIED_TOOL_AVAILABLE"), f"Expected SUCCESS or NO_VERIFIED_TOOL_AVAILABLE, got {res.get('status')}"
+    total_found = len(res["tools"]) + len(res.get("held_candidates", []))
+    assert total_found > 0, "Failed to retrieve tools from bundled catalog"
+    print(f"  ✅ [PASS] Bundled catalog fallback verified: retrieved {total_found} candidate tools")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,229 @@
+/*
+ * air10_exec_boundary.c - Hardened C11 Process Execution Supervisor
+ * =================================================================
+ * Provides deterministic, isolated execution supervision:
+ * - Fork/execv isolation with direct binary invocation (no shell injection)
+ * - Wall-clock and CPU time measurement via clock_gettime and rusage
+ * - Captures exit status, termination signals, memory usage (RSS)
+ * - Streaming SHA-256 computation on process stdout
+ * - Structured JSON output for audit DAG correlation
+ */
+
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
+#define _DARWIN_C_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <stdint.h>
+
+/* Minimal Self-Contained SHA-256 implementation */
+typedef struct {
+    uint32_t state[8];
+    uint64_t count;
+    uint8_t buffer[64];
+} SHA256_CTX;
+
+#define DBL_INT_ADD(a,b,c) if ((a += c) < c) ++(b)
+#define ROTRIGHT(a,b) (((a) >> (b)) | ((a) << (32-(b))))
+#define CH(x,y,z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0(x) (ROTRIGHT(x,2) ^ ROTRIGHT(x,13) ^ ROTRIGHT(x,22))
+#define EP1(x) (ROTRIGHT(x,6) ^ ROTRIGHT(x,11) ^ ROTRIGHT(x,25))
+#define SIG0(x) (ROTRIGHT(x,7) ^ ROTRIGHT(x,18) ^ ((x) >> 3))
+#define SIG1(x) (ROTRIGHT(x,17) ^ ROTRIGHT(x,19) ^ ((x) >> 10))
+
+static const uint32_t k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+static void sha256_transform(SHA256_CTX *ctx, const uint8_t data[]) {
+    uint32_t a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
+    for (i = 0, j = 0; i < 16; ++i, j += 4)
+        m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
+    for ( ; i < 64; ++i)
+        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; d = ctx->state[3];
+    e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h = ctx->state[7];
+    for (i = 0; i < 64; ++i) {
+        t1 = h + EP1(e) + CH(e,f,g) + k[i] + m[i];
+        t2 = EP0(a) + MAJ(a,b,c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void sha256_init(SHA256_CTX *ctx) {
+    ctx->state[0] = 0x6a09e667; ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372; ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f; ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab; ctx->state[7] = 0x5be0cd19;
+    ctx->count = 0;
+}
+
+static void sha256_update(SHA256_CTX *ctx, const uint8_t data[], size_t len) {
+    size_t i;
+    for (i = 0; i < len; ++i) {
+        ctx->buffer[ctx->count % 64] = data[i];
+        ctx->count++;
+        if ((ctx->count % 64) == 0)
+            sha256_transform(ctx, ctx->buffer);
+    }
+}
+
+static void sha256_final(SHA256_CTX *ctx, uint8_t hash[]) {
+    size_t i = ctx->count % 64;
+    ctx->buffer[i++] = 0x80;
+    if (i > 56) {
+        while (i < 64) ctx->buffer[i++] = 0x00;
+        sha256_transform(ctx, ctx->buffer);
+        memset(ctx->buffer, 0, 56);
+    } else {
+        while (i < 56) ctx->buffer[i++] = 0x00;
+    }
+    uint64_t total_bits = ctx->count * 8;
+    for (int j = 7; j >= 0; j--) {
+        ctx->buffer[56 + (7 - j)] = (total_bits >> (j * 8)) & 0xFF;
+    }
+    sha256_transform(ctx, ctx->buffer);
+    for (i = 0; i < 4; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            hash[j * 4 + i] = (ctx->state[j] >> (24 - i * 8)) & 0x000000ff;
+        }
+    }
+}
+
+static void hash_to_hex(const uint8_t hash[32], char hex_out[65]) {
+    for (int i = 0; i < 32; i++) {
+        sprintf(hex_out + (i * 2), "%02x", hash[i]);
+    }
+    hex_out[64] = '\0';
+}
+
+static double timespec_to_ms(struct timespec ts) {
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s <TRACE_ID> <PARENT_SPAN_ID> <BINARY_PATH> <INPUT_FILE>\n", argv[0]);
+        return 1;
+    }
+
+    const char *trace_id = argv[1];
+    const char *parent_span_id = argv[2];
+    const char *binary_path = argv[3];
+    const char *input_file = argv[4];
+
+    if (access(binary_path, X_OK) != 0) {
+        fprintf(stderr, "ERROR: Binary '%s' not found or not executable\n", binary_path);
+        return 126;
+    }
+    if (access(input_file, R_OK) != 0) {
+        fprintf(stderr, "ERROR: Input file '%s' not readable\n", input_file);
+        return 127;
+    }
+
+    int pipe_out[2];
+    if (pipe(pipe_out) != 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    struct timespec start_ts, end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* Child Process */
+        close(pipe_out[0]);
+        dup2(pipe_out[1], STDOUT_FILENO);
+        close(pipe_out[1]);
+
+        /* Set environment */
+        setenv("AIR10_TRACE_ID", trace_id, 1);
+        setenv("AIR10_PARENT_SPAN_ID", parent_span_id, 1);
+
+        char *args[] = { (char *)binary_path, (char *)input_file, NULL };
+        execv(binary_path, args);
+
+        /* If execv fails */
+        perror("execv");
+        _exit(127);
+    }
+
+    /* Parent Process: Supervisor */
+    close(pipe_out[1]);
+
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    uint8_t buffer[8192];
+    ssize_t bytes_read;
+    size_t total_stdout_bytes = 0;
+
+    while ((bytes_read = read(pipe_out[0], buffer, sizeof(buffer))) > 0) {
+        sha256_update(&ctx, buffer, bytes_read);
+        total_stdout_bytes += bytes_read;
+    }
+    close(pipe_out[0]);
+
+    uint8_t hash[32];
+    sha256_final(&ctx, hash);
+    char stdout_sha256[65];
+    hash_to_hex(hash, stdout_sha256);
+
+    int status = 0;
+    struct rusage usage;
+    wait4(pid, &status, 0, &usage);
+
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+
+    double wall_duration_ms = timespec_to_ms(end_ts) - timespec_to_ms(start_ts);
+    double utime_ms = (double)usage.ru_utime.tv_sec * 1000.0 + (double)usage.ru_utime.tv_usec / 1000.0;
+    double stime_ms = (double)usage.ru_stime.tv_sec * 1000.0 + (double)usage.ru_stime.tv_usec / 1000.0;
+    long max_rss = usage.ru_maxrss;
+#ifdef __APPLE__
+    max_rss = max_rss / 1024; /* Apple returns bytes, convert to KB */
+#endif
+
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1);
+
+    /* Emit deterministic machine verification JSON */
+    printf("{\n");
+    printf("  \"trace_id\": \"%s\",\n", trace_id);
+    printf("  \"parent_span_id\": \"%s\",\n", parent_span_id);
+    printf("  \"binary_path\": \"%s\",\n", binary_path);
+    printf("  \"input_file\": \"%s\",\n", input_file);
+    printf("  \"exit_code\": %d,\n", exit_code);
+    printf("  \"wall_duration_ms\": %.3f,\n", wall_duration_ms);
+    printf("  \"utime_ms\": %.3f,\n", utime_ms);
+    printf("  \"stime_ms\": %.3f,\n", stime_ms);
+    printf("  \"max_rss_kb\": %ld,\n", max_rss);
+    printf("  \"stdout_bytes\": %zu,\n", total_stdout_bytes);
+    printf("  \"stdout_sha256\": \"%s\",\n", stdout_sha256);
+    printf("  \"supervisor\": \"air10_exec_boundary_c11\"\n");
+    printf("}\n");
+
+    return exit_code;
+}

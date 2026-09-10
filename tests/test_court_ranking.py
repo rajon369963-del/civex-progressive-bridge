@@ -1,10 +1,10 @@
 import hashlib
-import os
 import sqlite3
-import tempfile
+
 import pytest
-from civex.court_ranking import CourtAwareRanker, ToolScoreBreakdown
 from civex.bridge import ProgressiveToolBridge
+from civex.court_ranking import CourtAwareRanker
+
 
 @pytest.fixture
 def hermetic_court_env(tmp_path):
@@ -62,11 +62,14 @@ def hermetic_court_env(tmp_path):
     conn.commit()
     conn.close()
 
+    verifier = MockVerifier()
+
     return {
         "db_path": str(db_file),
         "bin_ok": str(bin_ok),
         "bin_tampered": str(bin_tampered),
-        "bin_noexec": str(bin_noexec)
+        "bin_noexec": str(bin_noexec),
+        "verifier": verifier
     }
 
 class MockVerifier:
@@ -76,7 +79,7 @@ class MockVerifier:
         return tool_id in self.open_tools
 
 def test_exact_contract_quarantine_hard_zero(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     score = ranker.score_tool(
         tool_name="tool_quarantined",
         capability="JSON_STRICT",
@@ -89,7 +92,7 @@ def test_exact_contract_quarantine_hard_zero(hermetic_court_env):
     assert "HARD_EXCLUSION" in score.rationale
 
 def test_exact_contract_warning_penalty(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     score = ranker.score_tool(
         tool_name="tool_warning",
         capability="JSON_LENIENT",
@@ -103,7 +106,7 @@ def test_exact_contract_warning_penalty(hermetic_court_env):
     assert score.final_score > 0.0
 
 def test_exact_contract_allowed_full_confidence(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     score = ranker.score_tool(
         tool_name="tool_ok",
         capability="JSON_STRICT",
@@ -117,7 +120,7 @@ def test_exact_contract_allowed_full_confidence(hermetic_court_env):
     assert score.final_score > 0.0
 
 def test_unknown_contract_fail_closed_hold(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     # Tool exists, but contract_version='v2.0' is unverified
     score = ranker.score_tool(
         tool_name="tool_ok",
@@ -144,7 +147,7 @@ def test_authoritative_circuit_breaker_open(hermetic_court_env):
     assert score.status == "CIRCUIT_OPEN"
 
 def test_tampered_binary_digest_security_alert(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     score = ranker.score_tool(
         tool_name="tool_tampered",
         capability="JSON_STRICT",
@@ -158,7 +161,7 @@ def test_tampered_binary_digest_security_alert(hermetic_court_env):
     assert "SECURITY_ALERT" in score.rationale
 
 def test_non_executable_binary_failure(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     score = ranker.score_tool(
         tool_name="tool_noexec",
         capability="JSON_STRICT",
@@ -171,7 +174,7 @@ def test_non_executable_binary_failure(hermetic_court_env):
     assert score.status == "BINARY_NOT_EXECUTABLE"
 
 def test_missing_audit_db_fail_closed():
-    ranker = CourtAwareRanker(audit_db_path="/tmp/nonexistent_audit_xyz.db")
+    ranker = CourtAwareRanker(audit_db_path="/tmp/nonexistent_audit_xyz.db", verifier=MockVerifier())
     score = ranker.score_tool(
         tool_name="tool_ok",
         capability="JSON_STRICT"
@@ -180,7 +183,7 @@ def test_missing_audit_db_fail_closed():
     assert score.status == "VERIFICATION_UNAVAILABLE_HOLD"
 
 def test_discriminative_latency_scale(hermetic_court_env):
-    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"])
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
     s_1ms = ranker.score_tool("tool_ok", "JSON_STRICT", "RFC8259", "v1.0", binary_path=hermetic_court_env["bin_ok"], observed_latency_ms=1.0)
     s_10ms = ranker.score_tool("tool_ok", "JSON_STRICT", "RFC8259", "v1.0", binary_path=hermetic_court_env["bin_ok"], observed_latency_ms=10.0)
     s_100ms = ranker.score_tool("tool_ok", "JSON_STRICT", "RFC8259", "v1.0", binary_path=hermetic_court_env["bin_ok"], observed_latency_ms=100.0)

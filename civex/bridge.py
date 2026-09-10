@@ -374,8 +374,10 @@ class ProgressiveToolBridge:
         try:
             from .court_ranking import CourtAwareRanker
             self.ranker = CourtAwareRanker(verifier=self.verifier)
-        except Exception:
+            self.ranker_init_error = None
+        except Exception as e:
             self.ranker = None
+            self.ranker_init_error = str(e)
 
     @staticmethod
     def _build_fts5_query(query: str) -> str:
@@ -404,7 +406,9 @@ class ProgressiveToolBridge:
         contract_version: str = "v1.0",
         rank_with_court: bool = True
     ) -> dict[str, Any]:
-        """Search catalog with FTS5 BM25 ranking and apply authoritative CourtAwareRanker."""
+        """Search catalog with FTS5 BM25 ranking and apply authoritative CourtAwareRanker.
+        FAIL-CLOSED INVARIANT: Only court-verified tools with score > 0.0 enter routable tools.
+        """
         t0 = time.perf_counter()
         if not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
@@ -458,8 +462,26 @@ class ProgressiveToolBridge:
                     diag = {"id": bounded_id[:25], "err": "OVERSIZED"}
                 shadow_schemas.append(diag)
 
+        # FAIL-CLOSED CHECK: If ranker is unavailable, bridge MUST refuse routing
+        if self.ranker is None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "status": "VERIFICATION_UNAVAILABLE_HOLD",
+                "query": query,
+                "fts5_expr": fts_expr,
+                "category_filter": category,
+                "matched_count": 0,
+                "latency_ms": round(elapsed_ms, 3),
+                "tools": [],
+                "held_candidates": shadow_schemas,
+                "error": f"FAIL-CLOSED: CourtAwareRanker unavailable ({getattr(self, 'ranker_init_error', 'Uninitialized')}). Routing refused."
+            }
+
+        verified_tools = []
+        held_tools = []
+
         # Apply Court-Aware Ranking & Fail-Closed Exclusion
-        if rank_with_court and self.ranker is not None and shadow_schemas:
+        if shadow_schemas:
             eval_cap = capability or ("JSON_SINGLE_DOC_STRICT" if "json" in query.lower() else "DEFAULT_EXEC")
             for schema in shadow_schemas:
                 t_id = schema.get("id")
@@ -467,6 +489,7 @@ class ProgressiveToolBridge:
                 bin_path = r_match[3] if r_match else None
                 t_name = schema.get("name", t_id)
                 score = self.ranker.score_tool(
+                    tool_id=t_id,
                     tool_name=t_name,
                     capability=eval_cap,
                     input_format=input_format,
@@ -476,23 +499,31 @@ class ProgressiveToolBridge:
                 schema["court_score"] = score.final_score
                 schema["court_status"] = score.status
                 schema["court_rationale"] = score.rationale
-                schema["court_verified"] = (score.status == "ELIGIBLE")
+                schema["court_verified"] = (score.status == "ELIGIBLE" and score.final_score > 0.0)
 
-            # Re-sort: highest court utility score first, tiebreak by original BM25 rank
-            shadow_schemas.sort(key=lambda s: (s.get("court_score", 0.0) > 0.0, s.get("court_score", 0.0)), reverse=True)
+                # FAIL-CLOSED HARD EXCLUSION:
+                # Candidate MUST NOT enter routable tools if score <= 0.0 or court_verified != True
+                if schema["court_verified"]:
+                    verified_tools.append(schema)
+                else:
+                    held_tools.append(schema)
 
-        # Slice to requested limit
-        shadow_schemas = shadow_schemas[:limit]
+            # Sort verified candidates by court utility score
+            verified_tools.sort(key=lambda s: s.get("court_score", 0.0), reverse=True)
+
+        routable_tools = verified_tools[:limit]
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
+        status = "SUCCESS" if routable_tools else "NO_VERIFIED_TOOL_AVAILABLE"
         return {
-            "status": "SUCCESS",
+            "status": status,
             "query": query,
             "fts5_expr": fts_expr,
             "category_filter": category,
-            "matched_count": len(shadow_schemas),
+            "matched_count": len(routable_tools),
             "latency_ms": round(elapsed_ms, 3),
-            "tools": shadow_schemas
+            "tools": routable_tools,
+            "held_candidates": held_tools
         }
 
     def resolve_intent(
@@ -503,7 +534,9 @@ class ProgressiveToolBridge:
         input_format: str = "SINGLE_DOC_STRICT_RFC8259",
         contract_version: str = "v1.0"
     ) -> list[dict[str, Any]]:
-        """Convenience method returning the court-ranked list of shadow schemas directly."""
+        """Convenience method returning ONLY court-verified, routable shadow schemas.
+        Unverified or quarantined candidates are strictly excluded.
+        """
         res = self.find_tools(
             query=intent,
             limit=top_k,
