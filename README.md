@@ -18,9 +18,9 @@ Modern agentic LLMs face severe context bloat and reasoning degradation when con
 
 ---
 
-## 📊 AIR10 Internal Benchmarks (Apple Silicon M1, 5,283-Tool Catalog)
+## 📊 Architecture & Internal Benchmark Overview (5,283-Tool Catalog)
 
-> *Note: Metrics measured on local production catalog (macOS Darwin ARM64, Python 3.11, SQLite 3.43 with FTS5). External production workloads may vary based on disk I/O and query complexity.*
+> **Note & Disclaimer**: Illustrative and architectural comparison. Measurements reflect internal test runs on local production catalog (macOS Darwin ARM64, Python 3.11, SQLite 3.43 with FTS5). External baseline numbers are architectural reference estimates and are not claimed as independent head-to-head empirical results. A formal, fully reproducible comparative benchmark suite is scheduled for `v0.2.0`.
 
 | Benchmark Dimension | Full Context Injection | Embedding Vector RAG | **CIVEX Progressive Bridge** |
 | :--- | :--- | :--- | :--- |
