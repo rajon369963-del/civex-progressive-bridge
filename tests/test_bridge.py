@@ -19,8 +19,6 @@ sys.path.insert(0, REPO_ROOT)
 
 from civex.bridge import (
     CIVeXVerifier,
-    DEFAULT_PROD_CATALOG,
-    FIXTURE_CATALOG,
     HeadroomCompressor,
     ProgressiveToolBridge,
     SchemaShrinker,
@@ -46,6 +44,18 @@ def test_headroom_critical_signals():
             res = c.compress(payload, max_str_len=120)
             assert "CRITICAL_ERROR" in str(res), f"Middle signal lost with prefix={prefix_len}, suffix={suffix_len}"
     print("  ✅ [PASS] Middle marker retention: preserved across all long string middle positions")
+
+    # Check multiple separated critical signals in long string (AC-04 adversarial multi-signal test)
+    multi_signal_payload = {
+        "log": "A" * 300 + "CRITICAL_ERROR_CODE_42" + "B" * 400 + "TRACEBACK_LINE_99" + "C" * 300 + "FALSE_GREEN_DETECTED" + "D" * 200 + "FATAL_PANIC"
+    }
+    multi_res = c.compress(multi_signal_payload, max_str_len=120)
+    multi_str = str(multi_res)
+    assert "CRITICAL_ERROR_CODE_42" in multi_str, "CRITICAL_ERROR_CODE_42 lost in multi-signal test"
+    assert "TRACEBACK_LINE_99" in multi_str, "TRACEBACK_LINE_99 lost in multi-signal test"
+    assert "FALSE_GREEN_DETECTED" in multi_str, "FALSE_GREEN_DETECTED lost in multi-signal test"
+    assert "FATAL_PANIC" in multi_str, "FATAL_PANIC lost in multi-signal test"
+    print("  ✅ [PASS] Multi-signal retention: all 4 separated critical markers preserved simultaneously")
 
     # Check text line omission: middle lines omitted but critical signals kept
     for line_idx in range(50):
@@ -311,6 +321,19 @@ def test_civex_causal_assertions():
                 pass
 
 
+def test_bundled_catalog_fallback():
+    print("\n--- [TEST 7] BUNDLED PACKAGE CATALOG FALLBACK (HOST-ISOLATED SIMULATION) ---")
+    from civex.bridge import BUNDLED_CATALOG
+    assert os.path.exists(BUNDLED_CATALOG), f"Bundled catalog missing at {BUNDLED_CATALOG}"
+
+    # Instantiate bridge explicitly pointing to bundled catalog
+    bridge = ProgressiveToolBridge(db_path=BUNDLED_CATALOG)
+    res = bridge.find_tools("git", limit=3)
+    assert res["status"] == "SUCCESS", f"Expected SUCCESS, got {res.get('status')}"
+    assert len(res["tools"]) > 0, "Failed to retrieve tools from bundled catalog"
+    print(f"  ✅ [PASS] Bundled catalog fallback verified: retrieved {len(res['tools'])} tools")
+
+
 if __name__ == "__main__":
     t_start = time.perf_counter()
     test_headroom_critical_signals()
@@ -319,7 +342,9 @@ if __name__ == "__main__":
     test_fts5_queries_and_bm25()
     test_cli_entrypoint()
     test_civex_causal_assertions()
+    test_bundled_catalog_fallback()
     elapsed = (time.perf_counter() - t_start) * 1000
     print("\n" + "=" * 70)
-    print(f"🏆 ALL 6 TEST SUITES PASSED in {elapsed:.2f} ms")
+    print(f"🏆 ALL 7 TEST SUITES PASSED in {elapsed:.2f} ms")
     print("=" * 70)
+

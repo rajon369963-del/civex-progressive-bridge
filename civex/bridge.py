@@ -22,14 +22,15 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any
 
-# Default local production path, with fixture fallback for portable CI
+# Default local production path, with bundled package data and fixture fallback
 DEFAULT_PROD_CATALOG = os.path.expanduser('~/teamwork_projects/air10_ee_rig/db/air10_tool_catalog.sqlite')
+BUNDLED_CATALOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sample_catalog.sqlite")
 FIXTURE_CATALOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "sample_catalog.sqlite")
+
 
 
 # ---------------------------------------------------------------------------
@@ -94,33 +95,54 @@ class HeadroomCompressor:
             if len(data) > max_str_len:
                 if cls._has_critical_signal(data):
                     low = data.lower()
-                    best_pos = -1
-                    best_len = 0
+                    spans = []
                     for sig in cls.SIGNALS:
-                        pos = low.find(sig)
-                        if pos != -1:
-                            if best_pos == -1 or pos < best_pos:
-                                best_pos = pos
-                                best_len = len(sig)
+                        start = 0
+                        while True:
+                            idx = low.find(sig, start)
+                            if idx == -1:
+                                break
+                            w_start = max(0, idx - 40)
+                            w_end = min(len(data), idx + len(sig) + 50)
+                            spans.append((w_start, w_end))
+                            start = idx + len(sig)
 
-                    if best_pos != -1:
-                        w_start = max(0, best_pos - 40)
-                        w_end = min(len(data), best_pos + best_len + 50)
-                        sig_window = data[w_start:w_end]
+                    if spans:
+                        spans.sort(key=lambda s: s[0])
+                        merged = []
+                        for s_start, s_end in spans:
+                            if not merged:
+                                merged.append([s_start, s_end])
+                            else:
+                                last = merged[-1]
+                                if s_start <= last[1] + 30:
+                                    last[1] = max(last[1], s_end)
+                                else:
+                                    merged.append([s_start, s_end])
 
-                        head = data[:50] if w_start > 50 else ""
-                        tail = data[-50:] if w_end < len(data) - 50 else ""
-
+                        head_len = 50
+                        tail_len = 50
                         parts = []
-                        if head:
-                            parts.append(head)
-                        if w_start > len(head):
-                            parts.append(f"... [omitted {w_start - len(head)} chars] ...")
-                        parts.append(sig_window)
-                        if len(data) - len(tail) > w_end:
-                            parts.append(f"... [omitted {len(data) - len(tail) - w_end} chars] ...")
-                        if tail:
-                            parts.append(tail)
+
+                        if merged[0][0] > head_len:
+                            parts.append(data[:head_len])
+                            parts.append(f"... [omitted {merged[0][0] - head_len} chars] ...")
+                        elif merged[0][0] > 0:
+                            merged[0][0] = 0
+
+                        for i, (m_start, m_end) in enumerate(merged):
+                            parts.append(data[m_start:m_end])
+                            if i + 1 < len(merged):
+                                next_start = merged[i+1][0]
+                                if next_start > m_end:
+                                    parts.append(f"... [omitted {next_start - m_end} chars] ...")
+
+                        if len(data) - tail_len > merged[-1][1]:
+                            parts.append(f"... [omitted {len(data) - tail_len - merged[-1][1]} chars] ...")
+                            parts.append(data[-tail_len:])
+                        elif merged[-1][1] < len(data):
+                            parts.append(data[merged[-1][1]:])
+
                         return "".join(parts)
                 return data[:max_str_len] + f"... [truncated {len(data)-max_str_len} chars]"
             return data
@@ -334,11 +356,13 @@ class ProgressiveToolBridge:
             self.db_path = env_path
         elif os.path.exists(DEFAULT_PROD_CATALOG):
             self.db_path = DEFAULT_PROD_CATALOG
+        elif os.path.exists(BUNDLED_CATALOG):
+            self.db_path = BUNDLED_CATALOG
         elif os.path.exists(FIXTURE_CATALOG):
             self.db_path = FIXTURE_CATALOG
         else:
             raise FileNotFoundError(
-                f"No catalog database found at {DEFAULT_PROD_CATALOG} or fixture {FIXTURE_CATALOG}. "
+                f"No catalog database found at {DEFAULT_PROD_CATALOG}, bundled {BUNDLED_CATALOG}, or fixture {FIXTURE_CATALOG}. "
                 "Specify db_path or set CIVEX_CATALOG_DB environment variable."
             )
 
