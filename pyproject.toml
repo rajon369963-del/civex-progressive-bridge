@@ -35,6 +35,9 @@ Repository = "https://github.com/rajon369963-del/civex-progressive-bridge"
 [project.scripts]
 civex-bridge = "civex.bridge:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["civex*"]
+
 [tool.setuptools.package-data]
 civex = ["data/*.sqlite"]
-
