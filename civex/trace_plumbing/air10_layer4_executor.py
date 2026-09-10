@@ -17,7 +17,7 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
 
-def execute_process(trace_id, binary_path, input_file, parent_span_id=None, output_file=None):
+def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None, output_file=None, argv=None):
     span_id = f"span_exec_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
@@ -25,17 +25,27 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None, outp
     if not output_file:
         output_file = f"/tmp/air10_stdout_{trace_id}_{span_id}.out"
 
-    # 1. Compute input file SHA-256
-    with open(input_file, "rb") as f:
-        input_bytes = f.read()
-    input_sha256 = hashlib.sha256(input_bytes).hexdigest()
-    input_size = len(input_bytes)
+    # 1. Compute input file SHA-256 (if input_file provided)
+    input_sha256 = "NO_INPUT_FILE"
+    input_size = 0
+    if input_file and os.path.isfile(input_file):
+        with open(input_file, "rb") as f:
+            input_bytes = f.read()
+        input_sha256 = hashlib.sha256(input_bytes).hexdigest()
+        input_size = len(input_bytes)
 
     # 2. Compute binary SHA-256
     bin_sha256 = "UNKNOWN"
     if os.path.isfile(binary_path):
         with open(binary_path, "rb") as f:
             bin_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    # Determine command arguments
+    cmd_args = []
+    if argv is not None:
+        cmd_args = list(argv)
+    elif input_file:
+        cmd_args = [input_file]
 
     # 3. Supervised Execution (Prefer native C11 exec boundary)
     env = os.environ.copy()
@@ -46,7 +56,7 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None, outp
 
     if os.path.isfile(SUPERVISOR_BIN) and os.access(SUPERVISOR_BIN, os.X_OK):
         proc = subprocess.run(
-            [SUPERVISOR_BIN, trace_id, effective_parent or "root", binary_path, input_file],
+            [SUPERVISOR_BIN, trace_id, effective_parent or "root", binary_path] + cmd_args,
             capture_output=True, text=True, env=env
         )
         try:
@@ -64,7 +74,7 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None, outp
     else:
         # High-resolution clock python fallback
         t_start = time.perf_counter_ns()
-        p = subprocess.run([binary_path, input_file], capture_output=True, env=env)
+        p = subprocess.run([binary_path] + cmd_args, capture_output=True, env=env)
         t_end = time.perf_counter_ns()
 
         duration_us = (t_end - t_start) / 1_000.0
@@ -79,6 +89,16 @@ def execute_process(trace_id, binary_path, input_file, parent_span_id=None, outp
         stdout_preview = stdout_raw.decode("utf-8", errors="replace")[:200]
         stderr_preview = stderr_raw.decode("utf-8", errors="replace")[:200]
         supervisor_name = "python_process_runner"
+
+    # Strict Output Capture Parity Verification (Fail-Closed)
+    if output_file:
+        if not os.path.isfile(output_file):
+            raise RuntimeError(f"FAIL-CLOSED: Supervisor completed but output capture file '{output_file}' missing on disk")
+        with open(output_file, "rb") as of:
+            captured_bytes = of.read()
+        captured_sha = hashlib.sha256(captured_bytes).hexdigest()
+        if captured_sha != stdout_sha256:
+            raise RuntimeError(f"FAIL-CLOSED: Capture file SHA {captured_sha} != supervisor streaming SHA {stdout_sha256}")
 
     details = {
         "binary_path": binary_path,

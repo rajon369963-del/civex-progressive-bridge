@@ -647,6 +647,9 @@ def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_pat
         f.write('{"status": "ok"}')
     out_sha = hashlib.sha256(open(stdout_file, "rb").read()).hexdigest()
 
+    echo_bin = "/bin/echo"
+    bin_sha = hashlib.sha256(open(echo_bin, "rb").read()).hexdigest()
+
     trace_id = "tr_gate18_digest"
     conn = sqlite3.connect(hermetic_audit_db)
     conn.execute("""
@@ -654,8 +657,8 @@ def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_pat
         (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
         VALUES (?, 'span_exec_g18', 'span_root', 'PROCESS_EXECUTION', 'c11_supervisor', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
     """, (trace_id, json.dumps({
-        "binary_path": "/bin/echo",
-        "binary_sha256": "1" * 64,
+        "binary_path": echo_bin,
+        "binary_sha256": bin_sha,
         "input_file": input_file,
         "input_sha256": in_sha,
         "actual_returncode": 0,
@@ -680,13 +683,227 @@ def test_gate18_ledger_cryptographic_digest_assertion(hermetic_audit_db, tmp_pat
     assert row is not None
     sha_regex = re.compile(r"^[0-9a-fA-F]{64}$")
 
-    # Assert binary_sha256 is genuine 64-char hex, NOT 'BOUNDARY_INTERCEPTED'
+    # Assert binary_sha256 is genuine physical 64-char hex, NOT placeholder or zero sentinel
     assert row["binary_sha256"] != "BOUNDARY_INTERCEPTED"
+    assert row["binary_sha256"] != "0" * 64
     assert len(row["binary_sha256"]) == 64
     assert sha_regex.match(row["binary_sha256"]) is not None
+    assert row["binary_sha256"] == bin_sha
 
-    # Assert stdout_sha256 is genuine 64-char hex, NOT 'STDOUT_RECORDED'
+    # Assert stdout_sha256 is genuine 64-char hex, NOT placeholder or zero sentinel
     assert row["stdout_sha256"] != "STDOUT_RECORDED"
+    assert row["stdout_sha256"] != "0" * 64
     assert len(row["stdout_sha256"]) == 64
     assert sha_regex.match(row["stdout_sha256"]) is not None
     assert row["stdout_sha256"] == out_sha
+
+    # Test synthetic sentinel rejection: "0" * 64 must fail closed
+    trace_id_fake = "tr_gate18_fake_sentinel"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events 
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, 'span_exec_g18_fake', 'span_root', 'PROCESS_EXECUTION', 'c11_supervisor', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (trace_id_fake, json.dumps({
+        "binary_path": "/nonexistent/fake/bin",
+        "binary_sha256": "0" * 64,
+        "input_file": input_file,
+        "input_sha256": in_sha,
+        "actual_returncode": 0,
+        "duration_ms": 1.5,
+        "stdout_sha256": out_sha,
+        "output_file": stdout_file
+    })))
+    conn.commit()
+    conn.close()
+
+    verdict_fake = verify_trace(trace_id_fake, target_stdout_file=stdout_file, audit_db_path=hermetic_audit_db)
+    assert verdict_fake == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+
+def test_gate19_full_closed_loop_reality_test(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 19: Full End-to-End Closed-Loop Reality Test.
+    Proves the complete reality chain:
+    1. Quarantined champion with superseded_by pointing to replacement tool.
+    2. route_intent() resolves replacement dynamically without NameError or crashes.
+    3. execute_process() executes with multi-arg argv, tees stdout, verifies Layer 4 capture parity.
+    4. verify_trace() verifies input TOCTOU, stdout TOCTOU, genuine 64-char non-zero hex digests.
+    5. Induces 3 failures -> trips breaker -> 4th routing skips failed tool.
+    6. Verifies that mutating captured stdout fails closed with STDOUT_TOCTOU_INTEGRITY_VIOLATION.
+    """
+    from civex.bridge import CIVeXVerifier
+    from civex.trace_plumbing import (
+        air10_layer2_router,
+        air10_layer4_executor,
+        air10_layer5_verifier,
+    )
+
+    # Configure hermetic DB and state file
+    monkeypatch.setattr(air10_layer2_router, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer4_executor, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setattr(air10_layer5_verifier, "DB_PATH", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    cb_state_file = str(tmp_path / "gate19_cb_state.json")
+    monkeypatch.setattr(CIVeXVerifier, "STATE_FILE", cb_state_file)
+
+    # 1. Setup physical binaries
+    # champ_tool: quarantined champion script
+    champ_bin = str(tmp_path / "champ_tool.sh")
+    with open(champ_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(champ_bin, 0o755)
+    champ_sha = hashlib.sha256(open(champ_bin, "rb").read()).hexdigest()
+
+    # replacement_tool: valid worker script that reads input file from argv and prints valid JSON matching oracle
+    rep_bin = str(tmp_path / "replacement_tool.sh")
+    with open(rep_bin, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nfor arg do last="$arg"; done\ncat "$last"\nexit 0\n')
+    os.chmod(rep_bin, 0o755)
+    rep_sha = hashlib.sha256(open(rep_bin, "rb").read()).hexdigest()
+
+    # Seed hermetic audit database with contracts, baseline telemetry, and execution traces
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('champ_tool', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'QUARANTINED', ?, ?, 'CRITICAL_BUG: Memory leak on large streams', '2026-09-10T00:00:00Z', 'replacement_tool', '2026-09-10T00:00:00Z')
+    """, (champ_bin, champ_sha))
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('replacement_tool', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'VERIFIED_PASS: Pristine AST parity across 559 RFC 8259 documents', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (rep_bin, rep_sha))
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        VALUES ('tr_seed_replacement', 'JSON_PARSE', 'BATCH', '[]', 'replacement_tool', ?, ?, '/tmp/in.json', ?, ?, 0, 1.25, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (rep_bin, rep_sha, rep_sha, rep_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_replacement', 'span_seed', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "replacement_tool", "binary_path": rep_bin}),))
+    conn.commit()
+    conn.close()
+
+    # 2. Dynamic superseded_by Routing: candidate is champ_tool, router MUST resolve replacement_tool
+    trace_id_1 = "tr_gate19_e2e_01"
+    parent_span_root = "span_root_g19"
+    candidate_pool = [
+        {"name": "champ_tool", "binary": champ_bin}
+    ]
+
+    chosen_tool, chosen_bin, router_span_id = air10_layer2_router.route_intent(
+        trace_id=trace_id_1,
+        parent_span_id=parent_span_root,
+        intent_query="parse strict single doc json",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=candidate_pool
+    )
+    assert chosen_tool == "replacement_tool", f"Expected replacement_tool, got {chosen_tool}"
+    assert chosen_bin == rep_bin
+
+    # 3. Supervised Execution with multi-arg argv and stdout tee capture
+    input_file = str(tmp_path / "valid_input.json")
+    with open(input_file, "w", encoding="utf-8") as f:
+        f.write('{"civex_closed_loop": true, "score": 100}')
+    in_sha = hashlib.sha256(open(input_file, "rb").read()).hexdigest()
+
+    output_file = str(tmp_path / "captured_stdout_g19.json")
+    multi_argv = ["--mode", "strict", "--trace-id", trace_id_1, input_file]
+
+    rc, dur_ms, stdout_sha = air10_layer4_executor.execute_process(
+        trace_id=trace_id_1,
+        binary_path=chosen_bin,
+        input_file=input_file,
+        parent_span_id=router_span_id,
+        output_file=output_file,
+        argv=multi_argv
+    )
+    assert rc == 0
+    assert dur_ms > 0.0
+    assert os.path.isfile(output_file)
+    with open(output_file, "rb") as sf:
+        captured_bytes = sf.read()
+    assert hashlib.sha256(captured_bytes).hexdigest() == stdout_sha
+
+    # 4. Layer 5 Verification with AST equality and cryptographic digests
+    verdict = air10_layer5_verifier.verify_trace(
+        trace_id=trace_id_1,
+        target_stdout_file=output_file,
+        audit_db_path=hermetic_audit_db
+    )
+    assert verdict == "VERIFIED_PASS"
+
+    # Verify tool_traces_v2 cryptographic digests in DB
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM tool_traces_v2 WHERE trace_id = ?", (trace_id_1,)).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["chosen_tool"] == "replacement_tool"
+    assert row["verification_status"] == "VERIFIED_PASS"
+    assert row["binary_sha256"] == rep_sha
+    assert row["stdout_sha256"] == stdout_sha
+    assert row["binary_sha256"] != "0" * 64
+    assert row["stdout_sha256"] != "0" * 64
+
+    # 5. Circuit Breaker Feedback: Trip breaker with 3 failures, assert 4th routing skips tool
+    verifier = CIVeXVerifier()
+    verifier.record_outcome("replacement_tool", success=False, error_msg="Fault injection 1")
+    verifier.record_outcome("replacement_tool", success=False, error_msg="Fault injection 2")
+    verifier.record_outcome("replacement_tool", success=False, error_msg="Fault injection 3")
+    assert verifier.is_circuit_open("replacement_tool")
+
+    # 4th routing attempt MUST skip replacement_tool because circuit is open
+    trace_id_2 = "tr_gate19_circuit_open"
+    tool_after_trip, bin_after_trip, _ = air10_layer2_router.route_intent(
+        trace_id=trace_id_2,
+        parent_span_id=parent_span_root,
+        intent_query="parse strict single doc json",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=candidate_pool
+    )
+    assert tool_after_trip is None, "Circuit-tripped tool should have been refused fail-closed"
+    assert bin_after_trip is None
+
+    # Reset circuit breaker for replacement_tool
+    verifier.record_outcome("replacement_tool", success=True)
+    assert not verifier.is_circuit_open("replacement_tool")
+
+    # 6. Stdout TOCTOU Integrity Violation: Mutating captured stdout file fails closed
+    trace_id_3 = "tr_gate19_toctou_stdout"
+    output_file_toctou = str(tmp_path / "stdout_toctou.json")
+    rc_t, _, out_sha_t = air10_layer4_executor.execute_process(
+        trace_id=trace_id_3,
+        binary_path=rep_bin,
+        input_file=input_file,
+        parent_span_id=parent_span_root,
+        output_file=output_file_toctou,
+        argv=[input_file]
+    )
+    assert rc_t == 0
+
+    # Tamper with captured stdout file on physical disk before Layer 5 verification
+    with open(output_file_toctou, "w", encoding="utf-8") as f:
+        f.write('{"tampered": "ADVERSARIAL_MUTATION"}')
+
+    verdict_toctou = air10_layer5_verifier.verify_trace(
+        trace_id=trace_id_3,
+        target_stdout_file=output_file_toctou,
+        audit_db_path=hermetic_audit_db
+    )
+    assert verdict_toctou == "VERIFIED_FAIL_INVARIANT_VIOLATION"
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    cur = conn.cursor()
+    cur.execute("SELECT details_json FROM trace_events WHERE trace_id = ? AND stage = 'INDEPENDENT_VERIFICATION'", (trace_id_3,))
+    verif_row = cur.fetchone()
+    conn.close()
+    assert verif_row is not None
+    verif_details = json.loads(verif_row[0])
+    assert verif_details["semantic_result"] == "STDOUT_TOCTOU_INTEGRITY_VIOLATION"
+    assert "STDOUT_TOCTOU_MUTATION_DETECTED" in verif_details["failure_reason"]
+

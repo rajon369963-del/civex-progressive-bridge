@@ -547,8 +547,17 @@ class ProgressiveToolBridge:
         )
         return res.get("tools", [])
 
-    def hydrate_tool(self, tool_id: str) -> dict[str, Any] | None:
-        """Hydrates full schema and execution parameters on demand when chosen."""
+    def hydrate_tool(
+        self,
+        tool_id: str,
+        enforce_court: bool = True,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0"
+    ) -> dict[str, Any] | None:
+        """Hydrates full schema and execution parameters on demand when chosen.
+        Strictly enforces Court verification to prevent unverified known-tool-ID bypass.
+        """
         sql = (
             "SELECT tool_id, name, category, binary_path, exec_template, "
             "description, auto_trigger_intents, tags FROM tools_v2 WHERE tool_id = ? LIMIT 1;"
@@ -557,7 +566,7 @@ class ProgressiveToolBridge:
         if not rows:
             return None
         r = rows[0]
-        return {
+        tool_dict = {
             "tool_id": r[0],
             "name": r[1],
             "category": r[2],
@@ -567,6 +576,46 @@ class ProgressiveToolBridge:
             "intents": r[6],
             "tags": r[7]
         }
+
+        # FAIL-CLOSED COURT ENFORCEMENT ON DIRECT HYDRATION
+        if enforce_court:
+            if self.ranker is None:
+                return {
+                    "tool_id": tool_dict["tool_id"],
+                    "name": tool_dict["name"],
+                    "court_status": "VERIFICATION_UNAVAILABLE_HOLD",
+                    "court_score": 0.0,
+                    "court_verdict": "REFUSED_FAIL_CLOSED",
+                    "court_rationale": "COURT_REFUSAL: CourtAwareRanker unavailable. Direct hydration refused.",
+                    "binary_path": None,
+                    "exec_template": None
+                }
+
+            eval_cap = capability or ("JSON_SINGLE_DOC_STRICT" if "json" in tool_dict["name"].lower() else "DEFAULT_EXEC")
+            score = self.ranker.score_tool(
+                tool_id=tool_dict["tool_id"],
+                tool_name=tool_dict["name"],
+                capability=eval_cap,
+                input_format=input_format,
+                contract_version=contract_version,
+                binary_path=tool_dict["binary_path"]
+            )
+            if score.status != "ELIGIBLE" or score.final_score <= 0.0:
+                return {
+                    "tool_id": tool_dict["tool_id"],
+                    "name": tool_dict["name"],
+                    "court_status": score.status,
+                    "court_score": score.final_score,
+                    "court_verdict": "REFUSED_FAIL_CLOSED",
+                    "court_rationale": f"COURT_REFUSAL: Tool hydration blocked by Tool Court ({score.status}: {score.rationale})",
+                    "binary_path": None,
+                    "exec_template": None
+                }
+            tool_dict["court_status"] = score.status
+            tool_dict["court_score"] = score.final_score
+            tool_dict["court_verified"] = True
+
+        return tool_dict
 
 
 # ---------------------------------------------------------------------------

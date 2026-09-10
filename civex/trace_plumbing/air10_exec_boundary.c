@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <stdint.h>
+#include <errno.h>
 
 /* Minimal Self-Contained SHA-256 implementation */
 typedef struct {
@@ -148,7 +149,8 @@ int main(int argc, char *argv[]) {
     if (capture_path && capture_path[0] != '\0') {
         capture_fd = open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (capture_fd < 0) {
-            fprintf(stderr, "WARNING: Could not open AIR10_STDOUT_CAPTURE_PATH '%s' for writing\n", capture_path);
+            fprintf(stderr, "ERROR: Could not open AIR10_STDOUT_CAPTURE_PATH '%s' for writing: %s\n", capture_path, strerror(errno));
+            return 71;
         }
     }
 
@@ -213,12 +215,27 @@ int main(int argc, char *argv[]) {
         sha256_update(&ctx, buffer, bytes_read);
         total_stdout_bytes += bytes_read;
         if (capture_fd >= 0) {
-            ssize_t written = write(capture_fd, buffer, bytes_read);
-            (void)written;
+            size_t written_total = 0;
+            while (written_total < (size_t)bytes_read) {
+                ssize_t w = write(capture_fd, buffer + written_total, (size_t)bytes_read - written_total);
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    fprintf(stderr, "ERROR: Write to capture file '%s' failed: %s\n", capture_path, strerror(errno));
+                    close(pipe_out[0]);
+                    close(capture_fd);
+                    return 74;
+                }
+                written_total += (size_t)w;
+            }
         }
     }
     close(pipe_out[0]);
     if (capture_fd >= 0) {
+        if (fsync(capture_fd) != 0) {
+            fprintf(stderr, "ERROR: fsync on capture file '%s' failed: %s\n", capture_path, strerror(errno));
+            close(capture_fd);
+            return 74;
+        }
         close(capture_fd);
     }
 

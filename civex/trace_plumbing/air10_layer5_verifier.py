@@ -11,6 +11,7 @@ AIR10 Trace Architecture - Layer 5: Strict RFC 8259 & AST Structural Equivalence
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -183,23 +184,40 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
                 candidate_ast = None
                 if target_stdout_file and os.path.isfile(target_stdout_file):
                     with open(target_stdout_file, "rb") as out_f:
-                        cand_raw = out_f.read().strip()
-                    try:
-                        candidate_ast = json.loads(cand_raw.decode("utf-8"))
-                    except Exception:
-                        candidate_ast = None
+                        cand_raw_bytes = out_f.read()
 
-                if candidate_ast is not None:
-                    oracle_digest, _ = canonical_ast_digest(oracle_ast)
-                    cand_digest, _ = canonical_ast_digest(candidate_ast)
-                    if oracle_digest == cand_digest:
-                        verdict_status = "VERIFIED_PASS"
-                        semantic_result = "EXACT_AST_MATCH"
-                        failure_reason = "CANONICAL_AST_DIGEST_MATCHED"
+                    # STDOUT TOCTOU Verification (Fail-Closed)
+                    current_stdout_sha256 = hashlib.sha256(cand_raw_bytes).hexdigest()
+                    if exec_stdout_sha and current_stdout_sha256 != exec_stdout_sha:
+                        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+                        semantic_result = "STDOUT_TOCTOU_INTEGRITY_VIOLATION"
+                        failure_reason = f"STDOUT_TOCTOU_MUTATION_DETECTED: captured stdout file SHA {current_stdout_sha256} does not match executed stdout SHA {exec_stdout_sha}"
                     else:
-                        verdict_status = "VERIFIED_FAIL_AST_MISMATCH"
-                        semantic_result = "VIOLATION_AST_MISMATCH"
-                        failure_reason = f"Candidate AST digest {cand_digest[:12]} != Oracle digest {oracle_digest[:12]}"
+                        cand_raw = cand_raw_bytes.strip()
+                        try:
+                            candidate_ast = json.loads(cand_raw.decode("utf-8"))
+                        except Exception:
+                            candidate_ast = None
+
+                        if candidate_ast is not None:
+                            oracle_digest, _ = canonical_ast_digest(oracle_ast)
+                            cand_digest, _ = canonical_ast_digest(candidate_ast)
+                            if oracle_digest == cand_digest:
+                                verdict_status = "VERIFIED_PASS"
+                                semantic_result = "EXACT_AST_MATCH"
+                                failure_reason = "CANONICAL_AST_DIGEST_MATCHED"
+                            else:
+                                verdict_status = "VERIFIED_FAIL_AST_MISMATCH"
+                                semantic_result = "VIOLATION_AST_MISMATCH"
+                                failure_reason = f"Candidate AST digest {cand_digest[:12]} != Oracle digest {oracle_digest[:12]}"
+                        else:
+                            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+                            semantic_result = "VIOLATION_NO_AST_OUTPUT"
+                            failure_reason = "UNPARSEABLE_OR_EMPTY_STDOUT: Tool claimed exit 0 but stdout produced no valid machine-readable AST"
+                elif target_stdout_file:
+                    verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+                    semantic_result = "MISSING_STDOUT_CAPTURE_FILE"
+                    failure_reason = f"FAIL-CLOSED: Target stdout file '{target_stdout_file}' does not exist on physical disk"
                 else:
                     # Valid exit code, but did not emit machine-readable AST
                     verdict_status = "VERIFIED_PASS"
@@ -234,25 +252,53 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
     chosen_tool = router_details.get("chosen_tool", target_bin)
     candidates_json = json.dumps(router_details.get("candidates", []))
 
-    # Cryptographic digest integrity assertions
+    sha_hex_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
+    ZERO_SENTINEL = "0" * 64
+
+    # Cryptographic digest integrity checks (Fail-Closed, zero synthetic sentinels, NO assert)
     binary_sha256 = exec_bin_sha
-    if not binary_sha256 or len(binary_sha256) != 64 or binary_sha256 == "UNKNOWN":
-        if os.path.isfile(target_bin):
+    if not binary_sha256 or binary_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(binary_sha256):
+        if target_bin and os.path.isfile(target_bin):
             with open(target_bin, "rb") as bf:
                 binary_sha256 = hashlib.sha256(bf.read()).hexdigest()
         else:
-            binary_sha256 = "0" * 64
+            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+            semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
+            failure_reason = f"FAIL-CLOSED: binary_sha256 is missing, invalid hex, or synthetic zero sentinel: '{binary_sha256}'"
+
+    if not binary_sha256 or binary_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(binary_sha256):
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
+        failure_reason = f"FAIL-CLOSED: binary_sha256 is missing, invalid hex, or synthetic zero sentinel: '{binary_sha256}'"
+
+    if target_bin and os.path.isfile(target_bin):
+        with open(target_bin, "rb") as bf:
+            disk_bin_sha = hashlib.sha256(bf.read()).hexdigest()
+        if binary_sha256 and binary_sha256 != disk_bin_sha:
+            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+            semantic_result = "BINARY_INTEGRITY_VIOLATION"
+            failure_reason = f"FAIL-CLOSED: binary_sha256 '{binary_sha256}' does not match disk binary SHA '{disk_bin_sha}'"
 
     stdout_sha256 = exec_stdout_sha
-    if not stdout_sha256 or len(stdout_sha256) != 64:
+    if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
         if target_stdout_file and os.path.isfile(target_stdout_file):
             with open(target_stdout_file, "rb") as sf:
                 stdout_sha256 = hashlib.sha256(sf.read()).hexdigest()
         else:
-            stdout_sha256 = "0" * 64
+            verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+            semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
+            failure_reason = f"FAIL-CLOSED: stdout_sha256 is missing, invalid hex, or synthetic zero sentinel: '{stdout_sha256}'"
 
-    assert len(binary_sha256) == 64, f"Invalid binary_sha256 digest: {binary_sha256}"
-    assert len(stdout_sha256) == 64, f"Invalid stdout_sha256 digest: {stdout_sha256}"
+    if not stdout_sha256 or stdout_sha256 == ZERO_SENTINEL or not sha_hex_pattern.match(stdout_sha256):
+        verdict_status = "VERIFIED_FAIL_INVARIANT_VIOLATION"
+        semantic_result = "INVALID_CRYPTOGRAPHIC_DIGEST"
+        failure_reason = f"FAIL-CLOSED: stdout_sha256 is missing, invalid hex, or synthetic zero sentinel: '{stdout_sha256}'"
+
+    # Fallback to deterministic invalid SHA if validation failed, ensuring ledger write does not crash
+    if not binary_sha256 or len(binary_sha256) != 64:
+        binary_sha256 = "f" * 64
+    if not stdout_sha256 or len(stdout_sha256) != 64:
+        stdout_sha256 = "f" * 64
 
     cur.execute("""
         INSERT INTO tool_traces_v2
@@ -276,7 +322,7 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
         is_pass = (verdict_status == "VERIFIED_PASS")
         verifier.record_outcome(chosen_tool, success=is_pass, error_msg=failure_reason if not is_pass else None)
     except Exception as e:
-        sys.stderr.write(f"CIVEX_CIRCUIT_BREAKER_RECORD_ERROR: {e}\n")
+        raise RuntimeError(f"FEEDBACK_PERSISTENCE_HOLD: Failed to write circuit breaker outcome for tool '{chosen_tool}': {e}") from e
 
     print(f"VERDICT={verdict_status}|SEMANTIC={semantic_result}|REASON={failure_reason}|SPAN_ID={span_id}")
     return verdict_status

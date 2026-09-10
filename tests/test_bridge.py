@@ -335,6 +335,84 @@ def test_bundled_catalog_fallback():
     print(f"  ✅ [PASS] Bundled catalog fallback verified: retrieved {total_found} candidate tools")
 
 
+def test_hydrate_tool_court_enforcement(tmp_path):
+    print("\n--- [TEST 8] HYDRATE_TOOL COURT ENFORCEMENT & FAIL-CLOSED GATING ---")
+    import sqlite3
+
+    from civex.court_ranking import ToolScoreBreakdown
+
+    catalog_path = str(tmp_path / "test_hydrate_catalog.sqlite")
+    conn = sqlite3.connect(catalog_path)
+    conn.execute(
+        "CREATE TABLE tools_v2 (tool_id TEXT PRIMARY KEY, name TEXT, category TEXT, "
+        "binary_path TEXT, exec_template TEXT, description TEXT, auto_trigger_intents TEXT, tags TEXT);"
+    )
+    conn.execute(
+        "INSERT INTO tools_v2 VALUES ('tool_unverified', 'tool_unverified', 'cat', '/bin/echo', "
+        "'/bin/echo {args}', 'desc', 'intent', 'tags');"
+    )
+    conn.execute(
+        "INSERT INTO tools_v2 VALUES ('tool_verified', 'tool_verified', 'cat', '/bin/echo', "
+        "'/bin/echo {args}', 'desc', 'intent', 'tags');"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge = ProgressiveToolBridge(db_path=catalog_path)
+
+    # 1. Ranker None -> FAIL CLOSED
+    bridge.ranker = None
+    refused = bridge.hydrate_tool("tool_unverified", enforce_court=True)
+    assert refused["court_verdict"] == "REFUSED_FAIL_CLOSED"
+    assert refused["binary_path"] is None
+    assert refused["exec_template"] is None
+    print("  ✅ [PASS] Ranker None fails closed with REFUSED_FAIL_CLOSED")
+
+    # 2. Mock ranker with unverified/quarantined tool
+    class MockRanker:
+        def score_tool(self, tool_id, **kwargs):
+            if tool_id == "tool_verified":
+                return ToolScoreBreakdown(
+                    tool_name=tool_id, capability="cap", input_format="format",
+                    contract_version="v1.0", correctness_confidence=1.0,
+                    availability=1.0, performance=1.0, freshness=1.0, safety=1.0,
+                    final_score=0.95, status="ELIGIBLE", rationale="Pristine"
+                )
+            return ToolScoreBreakdown(
+                tool_name=tool_id, capability="cap", input_format="format",
+                contract_version="v1.0", correctness_confidence=0.0,
+                availability=0.0, performance=0.0, freshness=0.0, safety=0.0,
+                final_score=0.0, status="CONTRACT_QUARANTINED", rationale="Quarantined"
+            )
+
+    bridge.ranker = MockRanker()
+
+    # Tool unverified with enforce_court=True -> Refused
+    refused_court = bridge.hydrate_tool("tool_unverified", enforce_court=True)
+    assert refused_court["court_verdict"] == "REFUSED_FAIL_CLOSED"
+    assert refused_court["court_status"] == "CONTRACT_QUARANTINED"
+    assert refused_court["binary_path"] is None
+    assert refused_court["exec_template"] is None
+    print("  ✅ [PASS] Quarantined tool hydration blocked with REFUSED_FAIL_CLOSED")
+
+    # Tool unverified with enforce_court=False -> Bypasses check, returns full schema
+    bypassed = bridge.hydrate_tool("tool_unverified", enforce_court=False)
+    assert bypassed["tool_id"] == "tool_unverified"
+    assert bypassed["binary_path"] == "/bin/echo"
+    assert bypassed["exec_template"] == "/bin/echo {args}"
+    assert "court_verdict" not in bypassed
+    print("  ✅ [PASS] enforce_court=False allows administrative schema retrieval")
+
+    # Tool verified with enforce_court=True -> Allowed
+    allowed = bridge.hydrate_tool("tool_verified", enforce_court=True)
+    assert allowed["tool_id"] == "tool_verified"
+    assert allowed["binary_path"] == "/bin/echo"
+    assert allowed["court_status"] == "ELIGIBLE"
+    assert allowed["court_score"] == 0.95
+    assert allowed["court_verified"] is True
+    print("  ✅ [PASS] Verified tool hydration succeeds with ELIGIBLE status")
+
+
 if __name__ == "__main__":
     t_start = time.perf_counter()
     test_headroom_critical_signals()
@@ -344,8 +422,10 @@ if __name__ == "__main__":
     test_cli_entrypoint()
     test_civex_causal_assertions()
     test_bundled_catalog_fallback()
+    test_hydrate_tool_court_enforcement(tmp_path="/tmp")
     elapsed = (time.perf_counter() - t_start) * 1000
     print("\n" + "=" * 70)
-    print(f"🏆 ALL 7 TEST SUITES PASSED in {elapsed:.2f} ms")
+    print(f"🏆 ALL 8 TEST SUITES PASSED in {elapsed:.2f} ms")
     print("=" * 70)
+
 
