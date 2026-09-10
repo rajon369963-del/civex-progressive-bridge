@@ -370,6 +370,13 @@ class ProgressiveToolBridge:
         self.compressor = HeadroomCompressor()
         self.verifier = CIVeXVerifier()
 
+        # CHAKKA JODO: Authoritative CourtAwareRanker consuming CIVeX circuit breaker
+        try:
+            from .court_ranking import CourtAwareRanker
+            self.ranker = CourtAwareRanker(verifier=self.verifier)
+        except Exception:
+            self.ranker = None
+
     @staticmethod
     def _build_fts5_query(query: str) -> str:
         """Build disjunctive FTS5 MATCH expression from user query."""
@@ -387,13 +394,25 @@ class ProgressiveToolBridge:
                 parts.append(f'"{s}"*')
         return ' OR '.join(parts) if parts else '""'
 
-    def find_tools(self, query: str, category: str | None = None, limit: int = 3) -> dict[str, Any]:
-        """Search catalog with FTS5 BM25 ranking and return shadow schemas."""
+    def find_tools(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = 3,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0",
+        rank_with_court: bool = True
+    ) -> dict[str, Any]:
+        """Search catalog with FTS5 BM25 ranking and apply authoritative CourtAwareRanker."""
         t0 = time.perf_counter()
         if not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
 
         fts_expr = self._build_fts5_query(query)
+
+        # Retrieve a broader candidate pool to allow court ranking to promote certified tools
+        retrieval_limit = min(100, max(limit * 3, 10))
 
         if category:
             sql = """
@@ -406,7 +425,7 @@ class ProgressiveToolBridge:
             ORDER BY fts.rank ASC
             LIMIT ?;
             """
-            rows = self.con.execute(sql, [fts_expr, category, limit]).fetchall()
+            rows = self.con.execute(sql, [fts_expr, category, retrieval_limit]).fetchall()
         else:
             sql = """
             SELECT t.tool_id, t.name, t.category, t.binary_path, t.exec_template,
@@ -417,16 +436,16 @@ class ProgressiveToolBridge:
             ORDER BY fts.rank ASC
             LIMIT ?;
             """
-            rows = self.con.execute(sql, [fts_expr, limit]).fetchall()
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+            rows = self.con.execute(sql, [fts_expr, retrieval_limit]).fetchall()
 
         shadow_schemas = []
+        raw_row_map = {}
         for r in rows:
+            raw_id = str(r[0])
+            raw_row_map[raw_id] = r
             try:
                 shadow_schemas.append(SchemaShrinker.shrink_tool(r))
             except ValueError:
-                raw_id = str(r[0])
                 bounded_id = (raw_id[:40] + "...[trunc]") if len(raw_id) > 50 else raw_id
                 diag = {
                     "id": bounded_id,
@@ -439,6 +458,33 @@ class ProgressiveToolBridge:
                     diag = {"id": bounded_id[:25], "err": "OVERSIZED"}
                 shadow_schemas.append(diag)
 
+        # Apply Court-Aware Ranking & Fail-Closed Exclusion
+        if rank_with_court and self.ranker is not None and shadow_schemas:
+            eval_cap = capability or ("JSON_SINGLE_DOC_STRICT" if "json" in query.lower() else "DEFAULT_EXEC")
+            for schema in shadow_schemas:
+                t_id = schema.get("id")
+                r_match = raw_row_map.get(t_id)
+                bin_path = r_match[3] if r_match else None
+                t_name = schema.get("name", t_id)
+                score = self.ranker.score_tool(
+                    tool_name=t_name,
+                    capability=eval_cap,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    binary_path=bin_path
+                )
+                schema["court_score"] = score.final_score
+                schema["court_status"] = score.status
+                schema["court_rationale"] = score.rationale
+                schema["court_verified"] = (score.status == "ELIGIBLE")
+
+            # Re-sort: highest court utility score first, tiebreak by original BM25 rank
+            shadow_schemas.sort(key=lambda s: (s.get("court_score", 0.0) > 0.0, s.get("court_score", 0.0)), reverse=True)
+
+        # Slice to requested limit
+        shadow_schemas = shadow_schemas[:limit]
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
         return {
             "status": "SUCCESS",
             "query": query,
@@ -449,9 +495,23 @@ class ProgressiveToolBridge:
             "tools": shadow_schemas
         }
 
-    def resolve_intent(self, intent: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Convenience method returning the list of shadow schemas directly."""
-        res = self.find_tools(query=intent, limit=top_k)
+    def resolve_intent(
+        self,
+        intent: str,
+        top_k: int = 5,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0"
+    ) -> list[dict[str, Any]]:
+        """Convenience method returning the court-ranked list of shadow schemas directly."""
+        res = self.find_tools(
+            query=intent,
+            limit=top_k,
+            capability=capability,
+            input_format=input_format,
+            contract_version=contract_version,
+            rank_with_court=True
+        )
         return res.get("tools", [])
 
     def hydrate_tool(self, tool_id: str) -> dict[str, Any] | None:
