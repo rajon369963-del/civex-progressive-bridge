@@ -53,7 +53,7 @@ def orchestrate_request(
     active_candidates = list(candidate_pool) if candidate_pool is not None else None
 
     for attempt in range(1, max_attempts + 1):
-        chosen_tool, chosen_bin, span_router_id = air10_layer2_router.route_intent(
+        router_res = air10_layer2_router.route_intent(
             trace_id=trace_id,
             parent_span_id=span_intent_id,
             intent_query=intent_query,
@@ -61,6 +61,8 @@ def orchestrate_request(
             candidates_override=active_candidates,
             db_path=db_path
         )
+        chosen_tool, chosen_bin, span_router_id = router_res
+        permit = getattr(router_res, "permit", None)
 
         if not chosen_tool or not chosen_bin:
             return {
@@ -91,7 +93,10 @@ def orchestrate_request(
                 parent_span_id=span_shim_id,
                 output_file=out_file,
                 argv=cmd_args,
-                db_path=db_path
+                db_path=db_path,
+                require_court_sha=True,
+                permit=permit,
+                timeout_sec=30.0
             )
         except Exception as exec_err:
             try:
@@ -100,13 +105,25 @@ def orchestrate_request(
                 verifier.record_outcome(chosen_tool, success=False, error_msg=str(exec_err))
             except Exception:
                 pass
+
+            # Mandatory Immutable Audit Ledger logging (Do NOT swallow persistence errors)
+            air10_layer5_verifier.record_pre_execution_failure(
+                trace_id=trace_id,
+                attempt_no=attempt,
+                tool_name=chosen_tool,
+                binary_path=chosen_bin,
+                failure_reason=str(exec_err),
+                audit_db_path=db_path,
+                input_file=input_file
+            )
+
             if active_candidates:
                 active_candidates = [c for c in active_candidates if c.get("name") != chosen_tool]
             attempt_history.append({
                 "attempt": attempt,
                 "tool": chosen_tool,
                 "error": str(exec_err),
-                "verdict": "EXECUTION_EXCEPTION"
+                "verdict": "FAILED_BEFORE_EXECUTION"
             })
             continue
 

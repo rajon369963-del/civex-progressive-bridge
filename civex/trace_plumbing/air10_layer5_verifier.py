@@ -339,6 +339,84 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None, attempt_
     print(f"VERDICT={verdict_status}|SEMANTIC={semantic_result}|REASON={failure_reason}|SPAN_ID={span_id}")
     return verdict_status
 
+
+def record_pre_execution_failure(
+    trace_id: str,
+    attempt_no: int,
+    tool_name: str,
+    binary_path: str,
+    failure_reason: str,
+    audit_db_path: str | None = None,
+    exit_code: int = -1,
+    input_file: str | None = None
+) -> str:
+    """Records an immutable failed attempt row into tool_traces_v2 and trace_events when execution
+    aborts before or during supervisor launch (e.g. C11 supervisor exit 70-79, attestation hold, timeout).
+    FAIL-CLOSED: If DB write fails, raises an unswallowed exception.
+    """
+    active_db = audit_db_path or DB_PATH
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    span_id = f"span_fail_{uuid.uuid4().hex[:8]}"
+
+    if not os.path.exists(active_db):
+        raise RuntimeError(f"AUDIT_LEDGER_PERSISTENCE_FAILED_HOLD: Audit DB missing at '{active_db}'")
+
+    conn = sqlite3.connect(active_db)
+    cur = conn.cursor()
+    try:
+        # 1. Insert failed trace_event
+        err_details = {
+            "verifier": "AIR10_FAIL_CLOSED_PRE_EXEC_RECORDER",
+            "tool_name": tool_name,
+            "binary_path": binary_path,
+            "failure_reason": failure_reason,
+            "exit_code": exit_code,
+            "attempt_no": attempt_no
+        }
+        payload_raw = json.dumps(err_details, sort_keys=True).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
+
+        cur.execute("""
+            INSERT INTO trace_events
+            (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+            VALUES (?, ?, 'span_exec_failed', 'PROCESS_EXECUTION', 'pre_execution_guard', ?, ?, 'FAILED', ?)
+        """, (trace_id, span_id, now_iso, payload_sha256, json.dumps(err_details)))
+
+        # 2. Insert immutable tool_traces_v2 row with compound PK (trace_id, attempt_no)
+        cols = [c[1] for c in cur.execute("PRAGMA table_info(tool_traces_v2)").fetchall()]
+        if "attempt_no" in cols:
+            cur.execute("""
+                INSERT INTO tool_traces_v2
+                (trace_id, attempt_no, task_intent, traffic_class, router_candidates, chosen_tool, binary_path,
+                 binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code,
+                 duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+                VALUES (?, ?, 'TASK_EXECUTION_FAILURE', 'TASK_CLI_HOTPATH', '[]', ?, ?,
+                        NULL, ?, NULL, NULL, ?, 0.0, 'PRE_EXECUTION_FAILURE', 'FAILED_BEFORE_EXECUTION', ?, ?)
+            """, (
+                trace_id, attempt_no, tool_name, binary_path,
+                input_file, exit_code, failure_reason, now_iso
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO tool_traces_v2
+                (trace_id, task_intent, traffic_class, router_candidates, chosen_tool, binary_path,
+                 binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code,
+                 duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+                VALUES (?, 'TASK_EXECUTION_FAILURE', 'TASK_CLI_HOTPATH', '[]', ?, ?,
+                        NULL, ?, NULL, NULL, ?, 0.0, 'PRE_EXECUTION_FAILURE', 'FAILED_BEFORE_EXECUTION', ?, ?)
+            """, (
+                trace_id, tool_name, binary_path,
+                input_file, exit_code, failure_reason, now_iso
+            ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"AUDIT_LEDGER_PERSISTENCE_FAILED_HOLD: Failed to persist failed attempt to ledger: {e}") from e
+    finally:
+        conn.close()
+
+    return "FAILED_BEFORE_EXECUTION"
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: air10_layer5_verifier.py <TRACE_ID> [INPUT_FILE] [STDOUT_FILE]", file=sys.stderr)

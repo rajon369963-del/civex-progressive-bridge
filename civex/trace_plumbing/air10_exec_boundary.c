@@ -242,7 +242,7 @@ int main(int argc, char *argv[]) {
     char snapshot_path[512];
     snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", snap_dir, executed_binary_sha256);
     
-    int snap_fd = open(snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    int snap_fd = open(snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0500);
     if (snap_fd >= 0) {
         size_t written_total = 0;
         int write_err = 0;
@@ -270,10 +270,10 @@ int main(int argc, char *argv[]) {
             return 71;
         }
         close(snap_fd);
-        chmod(snapshot_path, 0700);
+        chmod(snapshot_path, 0500);
     } else if (errno == EEXIST) {
-        /* Pre-existing snapshot: verify ownership and re-hash all bytes (Anti-Poisoning) */
-        int exist_fd = open(snapshot_path, O_RDONLY);
+        /* Pre-existing snapshot: verify ownership, permissions, and re-hash all bytes (Anti-Poisoning) */
+        int exist_fd = open(snapshot_path, O_RDONLY | O_NOFOLLOW);
         if (exist_fd < 0) {
             free(bin_bytes);
             fprintf(stderr, "ERROR: Cannot open existing snapshot for verification: %s\n", strerror(errno));
@@ -289,6 +289,12 @@ int main(int argc, char *argv[]) {
             close(exist_fd);
             free(bin_bytes);
             fprintf(stderr, "ERROR: SNAPSHOT_OWNERSHIP_MISMATCH: owner %d != current uid %d\n", (int)st.st_uid, (int)getuid());
+            return 79;
+        }
+        if ((st.st_mode & 0777) != 0500 && (st.st_mode & 0777) != 0700) {
+            close(exist_fd);
+            free(bin_bytes);
+            fprintf(stderr, "ERROR: SNAPSHOT_PERMISSIONS_MISMATCH: mode %o untrusted\n", (unsigned int)(st.st_mode & 0777));
             return 79;
         }
         char exist_sha[65] = {0};
@@ -389,19 +395,26 @@ int main(int argc, char *argv[]) {
                 free(inp_bytes);
                 return 71;
             }
-            fsync(in_snap_fd);
+            if (fsync(in_snap_fd) != 0) {
+                unlink(input_snapshot_path);
+                close(in_snap_fd);
+                free(inp_bytes);
+                fprintf(stderr, "ERROR: Failed to fsync input snapshot\n");
+                return 71;
+            }
             close(in_snap_fd);
             chmod(input_snapshot_path, 0600);
         } else if (errno == EEXIST) {
-            int ex_in_fd = open(input_snapshot_path, O_RDONLY);
+            int ex_in_fd = open(input_snapshot_path, O_RDONLY | O_NOFOLLOW);
             if (ex_in_fd < 0) {
                 free(inp_bytes);
                 return 79;
             }
             struct stat inst;
-            if (fstat(ex_in_fd, &inst) != 0 || inst.st_uid != getuid()) {
+            if (fstat(ex_in_fd, &inst) != 0 || inst.st_uid != getuid() || ((inst.st_mode & 0777) != 0600 && (inst.st_mode & 0777) != 0400)) {
                 close(ex_in_fd);
                 free(inp_bytes);
+                fprintf(stderr, "ERROR: INPUT_SNAPSHOT_SECURITY: untrusted ownership or permissions on existing input snapshot\n");
                 return 79;
             }
             char ex_in_sha[65] = {0};

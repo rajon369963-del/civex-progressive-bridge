@@ -18,7 +18,24 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
 
-def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None, output_file=None, argv=None, db_path=None, expected_binary_sha=None, expected_input_sha=None, require_court_sha=False):
+class ExecutionTimeoutError(RuntimeError):
+    """Raised when supervised tool execution exceeds configured deadline."""
+
+
+def execute_process(
+    trace_id,
+    binary_path,
+    input_file=None,
+    parent_span_id=None,
+    output_file=None,
+    argv=None,
+    db_path=None,
+    expected_binary_sha=None,
+    expected_input_sha=None,
+    require_court_sha=True,
+    permit=None,
+    timeout_sec=30.0
+):
     span_id = f"span_exec_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
@@ -27,12 +44,32 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
     if not output_file:
         output_file = f"/tmp/air10_stdout_{trace_id}_{span_id}.out"
 
-    # 1. Compute input file size (if input_file provided)
+    # 1. Supervised Execution Invariant: Supervisor binary MUST be available (Fail-Closed)
+    supervisor_bin = os.environ.get("AIR10_EXEC_BOUNDARY", SUPERVISOR_BIN)
+    if not (os.path.isfile(supervisor_bin) and os.access(supervisor_bin, os.X_OK)):
+        err_msg = f"EXECUTION_SUPERVISOR_UNAVAILABLE_HOLD: Mandatory C11 execution supervisor '{supervisor_bin}' missing or not executable. Unsupervised Python fallback strictly refused (fail-closed)."
+        sys.stderr.write(f"{err_msg}\n")
+        raise RuntimeError(err_msg)
+
+    # 2. Compute input file size (if input_file provided)
     input_size = 0
     if input_file and os.path.isfile(input_file):
         input_size = os.path.getsize(input_file)
 
-    # 2. Resolve Court-certified expected binary SHA if not passed explicitly
+    # 3. Extract Court-certified expected binary SHA from CourtExecutionPermit
+    if permit is not None:
+        if isinstance(permit, dict):
+            permit_bin = permit.get("binary_path")
+            permit_sha = permit.get("approved_sha")
+        else:
+            permit_bin = getattr(permit, "binary_path", None)
+            permit_sha = getattr(permit, "approved_sha", None)
+        if permit_bin and os.path.realpath(binary_path) != os.path.realpath(permit_bin):
+            raise RuntimeError(f"COURT_PERMIT_PATH_MISMATCH_HOLD: Execution binary '{binary_path}' != permit binary '{permit_bin}'")
+        if permit_sha:
+            expected_binary_sha = permit_sha
+
+    # Resolve Court-certified expected binary SHA from DB if not yet resolved
     if not expected_binary_sha and os.path.exists(active_db):
         try:
             conn = sqlite3.connect(active_db)
@@ -57,13 +94,6 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
     elif input_file:
         cmd_args = [input_file]
 
-    # 3. Supervised Execution (MANDATORY C11 Execution Boundary Supervisor - Zero Python Fallback)
-    supervisor_bin = os.environ.get("AIR10_EXEC_BOUNDARY", SUPERVISOR_BIN)
-    if not (os.path.isfile(supervisor_bin) and os.access(supervisor_bin, os.X_OK)):
-        err_msg = f"EXECUTION_SUPERVISOR_UNAVAILABLE_HOLD: Mandatory C11 execution supervisor '{supervisor_bin}' missing or not executable. Unsupervised Python fallback strictly refused (fail-closed)."
-        sys.stderr.write(f"{err_msg}\n")
-        raise RuntimeError(err_msg)
-
     env = os.environ.copy()
     env["AIR10_TRACE_ID"] = trace_id
     env["AIR10_STDOUT_CAPTURE_PATH"] = output_file
@@ -77,10 +107,15 @@ def execute_process(trace_id, binary_path, input_file=None, parent_span_id=None,
     if expected_input_sha:
         env["AIR10_EXPECTED_INPUT_SHA"] = expected_input_sha
 
-    proc = subprocess.run(
-        [supervisor_bin, trace_id, effective_parent or "root", binary_path] + cmd_args,
-        capture_output=True, text=True, env=env
-    )
+    try:
+        proc = subprocess.run(
+            [supervisor_bin, trace_id, effective_parent or "root", binary_path] + cmd_args,
+            capture_output=True, text=True, env=env, timeout=timeout_sec
+        )
+    except subprocess.TimeoutExpired as te:
+        err_msg = f"EXECUTION_TIMEOUT_HOLD: Process execution exceeded deadline of {timeout_sec}s"
+        sys.stderr.write(f"{err_msg}\n")
+        raise ExecutionTimeoutError(err_msg) from te
     if 70 <= proc.returncode <= 79:
         raise RuntimeError(
             f"EXECUTION_SUPERVISOR_FAIL_CLOSED: C11 supervisor exited with code {proc.returncode} (exit {proc.returncode}). "

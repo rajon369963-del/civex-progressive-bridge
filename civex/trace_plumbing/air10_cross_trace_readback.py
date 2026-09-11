@@ -51,16 +51,18 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
                duration_ms, semantic_equivalence, verification_status, failure_reason, created_at
         FROM tool_traces_v2
         WHERE trace_id = ?
+        ORDER BY attempt_no ASC
     """, (trace_id,))
-    v2_row = cur.fetchone()
+    v2_rows = cur.fetchall()
     conn.close()
 
     if not events:
         fatal_violation(f"No trace_events found for trace_id={trace_id}")
 
     # Invariant 8: Summary record MUST exist
-    if not v2_row:
+    if not v2_rows:
         fatal_violation(f"No tool_traces_v2 summary row found for trace_id={trace_id}! Trace is unsealed/orphaned!")
+    v2_row = v2_rows[-1]
 
     print("=" * 95)
     print(f"🏛️ AIR10 STRICT FAIL-CLOSED CAUSAL DAG VALIDATION: {trace_id}")
@@ -83,7 +85,7 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     for ev in events:
         eid, sid, parent_sid, stage, prod, ts, p_sha, status, details_str = ev
         event_by_span[sid] = ev
-        event_by_stage[stage] = ev
+        event_by_stage.setdefault(stage, ev)
 
         if parent_sid == "ROOT_SPAN" or parent_sid is None or parent_sid == "NULL":
             root_spans.append(sid)
@@ -118,10 +120,10 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     dfs(root_span)
 
     if has_cycle:
-        fatal_violation("Cycle detected in causal span graph!")
-    print("  [3] NO_CYCLES == True                     : ✅ PASS (Acyclic Directed Graph)")
+        fatal_violation("Cycle detected in span graph! Graph must be a strictly directed acyclic graph (DAG)")
+    print("  [3] NO_CYCLES == True                     : ✅ PASS (Graph is strictly acyclic)")
 
-    # Invariant 4: No Orphans (all nodes reachable from root)
+    # Invariant 4: No Orphan Nodes
     if len(visited) != len(span_ids):
         orphans = span_set - visited
         fatal_violation(f"Orphan spans detected! Nodes not reachable from root: {orphans}")
@@ -129,38 +131,67 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
 
     # Invariant 5A: Strict Stage Sequence Order (FAIL-CLOSED, NO WARNINGS!)
     stages_in_order = [ev[3] for ev in events]
-    if stages_in_order != EXPECTED_STAGES:
-        fatal_violation(f"STAGE_ORDER mismatch! Received {stages_in_order} != Expected {EXPECTED_STAGES}")
-    print("  [5] STAGE_ORDER == INTENT->ROUTER->SHIM->EXEC->VERIF : ✅ PASS")
+    num_attempts = len(v2_rows)
 
-    # Invariant 5B: Strict Linear Causal Edge Verification (INTENT -> ROUTER -> SHIM -> EXEC -> VERIFIER)
-    # Check direct parent-child edges between stages
-    stage_sequence = [
-        ("INTENT", None),
-        ("ROUTER_EVALUATION", "INTENT"),
-        ("SHIM_INTERCEPT", "ROUTER_EVALUATION"),
-        ("PROCESS_EXECUTION", "SHIM_INTERCEPT"),
-        ("INDEPENDENT_VERIFICATION", "PROCESS_EXECUTION")
-    ]
-    for child_stage, exp_parent_stage in stage_sequence:
-        child_ev = event_by_stage.get(child_stage)
-        if not child_ev:
-            fatal_violation(f"Missing expected stage: {child_stage}")
-        child_sid = child_ev[1]
-        actual_parent_sid = child_ev[2]
+    if num_attempts == 1:
+        if stages_in_order != EXPECTED_STAGES:
+            fatal_violation(f"STAGE_ORDER mismatch! Received {stages_in_order} != Expected {EXPECTED_STAGES}")
+        print("  [5] STAGE_ORDER == INTENT->ROUTER->SHIM->EXEC->VERIF : ✅ PASS")
 
-        if exp_parent_stage is None:
-            if actual_parent_sid not in ("ROOT_SPAN", None, "NULL"):
-                fatal_violation(f"Root stage {child_stage} ({child_sid}) has unexpected parent '{actual_parent_sid}'")
-        else:
-            exp_parent_ev = event_by_stage.get(exp_parent_stage)
-            if not exp_parent_ev:
-                fatal_violation(f"Missing parent stage {exp_parent_stage} for {child_stage}")
-            exp_parent_sid = exp_parent_ev[1]
-            if actual_parent_sid != exp_parent_sid:
-                fatal_violation(f"CAUSAL_EDGE mismatch! Stage {child_stage} parent is '{actual_parent_sid}', expected {exp_parent_stage} ('{exp_parent_sid}')")
+        # Invariant 5B: Strict Linear Causal Edge Verification (Single Attempt)
+        stage_sequence = [
+            ("INTENT", None),
+            ("ROUTER_EVALUATION", "INTENT"),
+            ("SHIM_INTERCEPT", "ROUTER_EVALUATION"),
+            ("PROCESS_EXECUTION", "SHIM_INTERCEPT"),
+            ("INDEPENDENT_VERIFICATION", "PROCESS_EXECUTION")
+        ]
+        for child_stage, exp_parent_stage in stage_sequence:
+            child_ev = event_by_stage.get(child_stage)
+            if not child_ev:
+                fatal_violation(f"Missing expected stage: {child_stage}")
+            child_sid = child_ev[1]
+            actual_parent_sid = child_ev[2]
 
-    print("  [6] DIRECT_CAUSAL_EDGES == True           : ✅ PASS (Strict linear unbranched dependency chain)")
+            if exp_parent_stage is None:
+                if actual_parent_sid not in ("ROOT_SPAN", None, "NULL"):
+                    fatal_violation(f"Root stage {child_stage} ({child_sid}) has unexpected parent '{actual_parent_sid}'")
+            else:
+                exp_parent_ev = event_by_stage.get(exp_parent_stage)
+                if not exp_parent_ev:
+                    fatal_violation(f"Missing parent stage {exp_parent_stage} for {child_stage}")
+                exp_parent_sid = exp_parent_ev[1]
+                if actual_parent_sid != exp_parent_sid:
+                    fatal_violation(f"CAUSAL_EDGE mismatch! Stage {child_stage} parent is '{actual_parent_sid}', expected {exp_parent_stage} ('{exp_parent_sid}')")
+
+        print("  [6] DIRECT_CAUSAL_EDGES == True           : ✅ PASS (Strict linear unbranched dependency chain)")
+    else:
+        # Multi-attempt DAG: root INTENT followed by num_attempts execution blocks
+        expected_multi_stages = ["INTENT"] + ["ROUTER_EVALUATION", "SHIM_INTERCEPT", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"] * num_attempts
+        if stages_in_order != expected_multi_stages:
+            fatal_violation(f"MULTI_ATTEMPT_STAGE_ORDER mismatch! Received {stages_in_order} != Expected {expected_multi_stages}")
+        print(f"  [5] STAGE_ORDER == INTENT + {num_attempts}x(ROUTER->SHIM->EXEC->VERIF) : ✅ PASS")
+
+        intent_sid = events[0][1]
+        for att_idx in range(num_attempts):
+            base = 1 + att_idx * 4
+            r_ev = events[base]
+            s_ev = events[base + 1]
+            e_ev = events[base + 2]
+            v_ev = events[base + 3]
+
+            # Router parent is either root INTENT or previous verification
+            valid_parents = (intent_sid, events[base - 1][1] if base > 1 else intent_sid)
+            if r_ev[2] not in valid_parents:
+                fatal_violation(f"Attempt {att_idx+1} ROUTER parent '{r_ev[2]}' not in valid parents {valid_parents}")
+            if s_ev[2] != r_ev[1]:
+                fatal_violation(f"Attempt {att_idx+1} SHIM parent '{s_ev[2]}' != ROUTER '{r_ev[1]}'")
+            if e_ev[2] != s_ev[1]:
+                fatal_violation(f"Attempt {att_idx+1} EXEC parent '{e_ev[2]}' != SHIM '{s_ev[1]}'")
+            if v_ev[2] != e_ev[1]:
+                fatal_violation(f"Attempt {att_idx+1} VERIF parent '{v_ev[2]}' != EXEC '{e_ev[1]}'")
+
+        print(f"  [6] DIRECT_CAUSAL_EDGES == True           : ✅ PASS ({num_attempts} causal attempt sub-chains verified)")
 
     # Invariant 7: Structured Field-for-Field Correlation against shim_intercept.log
     shim_log_found = False
@@ -186,12 +217,18 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     if not shim_log_found or not shim_line_parsed:
         fatal_violation(f"No structured SHIM line found in {active_shim} for trace {trace_id}!")
 
-    shim_ev = event_by_stage["SHIM_INTERCEPT"]
-    router_ev = event_by_stage["ROUTER_EVALUATION"]
-    db_shim_span = shim_ev[1]
-    db_shim_parent = shim_ev[2]
-    db_router_span = router_ev[1]
-    db_shim_details = json.loads(shim_ev[8])
+    # Correlate shim line against the matching SHIM_INTERCEPT span in the trace
+    matching_shim_ev = event_by_span.get(shim_line_parsed["span_id"])
+    if not matching_shim_ev:
+        # Fallback to last shim event
+        all_shims = [ev for ev in events if ev[3] == "SHIM_INTERCEPT"]
+        matching_shim_ev = all_shims[-1] if all_shims else None
+    if not matching_shim_ev:
+        fatal_violation("No SHIM_INTERCEPT event found in trace!")
+
+    db_shim_span = matching_shim_ev[1]
+    db_shim_parent = matching_shim_ev[2]
+    db_shim_details = json.loads(matching_shim_ev[8])
     db_parent_pid = db_shim_details.get("parent_pid")
     db_target_bin = db_shim_details.get("target_bin") or db_shim_details.get("binary_path")
 
@@ -200,8 +237,8 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
         fatal_violation(f"Shim log trace_id '{shim_line_parsed['trace_id']}' != expected '{trace_id}'")
     if shim_line_parsed["span_id"] != db_shim_span:
         fatal_violation(f"Shim log span_id '{shim_line_parsed['span_id']}' != DB '{db_shim_span}'")
-    if shim_line_parsed["parent_span_id"] != db_router_span:
-        fatal_violation(f"Shim log parent_span_id '{shim_line_parsed['parent_span_id']}' != DB router '{db_router_span}'")
+    if shim_line_parsed["parent_span_id"] != db_shim_parent:
+        fatal_violation(f"Shim log parent_span_id '{shim_line_parsed['parent_span_id']}' != DB parent '{db_shim_parent}'")
     if shim_line_parsed["bin"] != db_target_bin:
         fatal_violation(f"Shim log target_bin '{shim_line_parsed['bin']}' != DB '{db_target_bin}'")
     if shim_line_parsed["pid"] != db_parent_pid:

@@ -159,10 +159,50 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
                         break
 
     # STRICT FAIL-CLOSED INVARIANT: NO FALLBACK_UNRANKED!
+    permit = None
     if not chosen_tool:
         chosen_tool = None
         chosen_binary = None
         selection_rationale = "NO_VERIFIED_TOOL_AVAILABLE: All candidate tools held, quarantined, or unverified by Court"
+    else:
+        # Issue CourtExecutionPermit bound to exact Court contract verdict
+        approved_sha = ""
+        if 'best_breakdown' in locals() and best_breakdown and best_breakdown.binary_sha256:
+            approved_sha = best_breakdown.binary_sha256
+        elif 'sup_score' in locals() and sup_score and sup_score.binary_sha256:
+            approved_sha = sup_score.binary_sha256
+
+        if not approved_sha and os.path.exists(active_db):
+            try:
+                conn = sqlite3.connect(f"file:{active_db}?mode=ro", uri=True)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT binary_sha256 FROM tool_contract_verdicts_v2 WHERE tool_name = ? AND capability = ? AND status = 'ALLOWED' LIMIT 1",
+                    (chosen_tool, required_capability)
+                )
+                r = cur.fetchone()
+                if r and r[0]:
+                    approved_sha = r[0]
+                conn.close()
+            except Exception:
+                pass
+
+        try:
+            from civex.court_ranking import CourtExecutionPermit
+        except Exception:
+            from court_ranking import CourtExecutionPermit
+
+        permit = CourtExecutionPermit(
+            permit_id=f"permit_{uuid.uuid4().hex[:12]}",
+            tool_name=chosen_tool,
+            capability=required_capability,
+            input_format=input_format,
+            contract_version=contract_version,
+            binary_path=chosen_binary,
+            approved_sha=approved_sha,
+            status="ELIGIBLE",
+            issued_at=now_iso
+        )
 
     # 3. Correlation payload & hash
     details = {
@@ -174,7 +214,8 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
         "chosen_tool": chosen_tool,
         "chosen_binary": chosen_binary,
         "selection_rationale": selection_rationale,
-        "parent_span_id": parent_span_id
+        "parent_span_id": parent_span_id,
+        "permit": permit.to_dict() if permit else None
     }
     payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
@@ -192,7 +233,18 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
         conn.close()
 
     print(f"CHOSEN_TOOL={chosen_tool}|CHOSEN_BINARY={chosen_binary}|SPAN_ID={span_id}")
-    return chosen_tool, chosen_binary, span_id
+    return RouteResult(chosen_tool, chosen_binary, span_id, permit=permit)
+
+
+class RouteResult(tuple):
+    """3-tuple subclass: (chosen_tool, chosen_binary, span_id) that also provides .permit attribute."""
+    def __new__(cls, chosen_tool, chosen_binary, span_id, permit=None):
+        inst = super().__new__(cls, (chosen_tool, chosen_binary, span_id))
+        inst.chosen_tool = chosen_tool
+        inst.chosen_binary = chosen_binary
+        inst.span_id = span_id
+        inst.permit = permit
+        return inst
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:

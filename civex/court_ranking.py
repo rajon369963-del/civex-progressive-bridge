@@ -46,6 +46,34 @@ class ToolScoreBreakdown:
     superseded_by: str | None = None
 
 
+@dataclass(frozen=True)
+class CourtExecutionPermit:
+    permit_id: str
+    tool_name: str
+    capability: str
+    input_format: str
+    contract_version: str
+    binary_path: str
+    approved_sha: str
+    status: str
+    verdict_id: str | None = None
+    issued_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "permit_id": self.permit_id,
+            "tool_name": self.tool_name,
+            "capability": self.capability,
+            "input_format": self.input_format,
+            "contract_version": self.contract_version,
+            "binary_path": self.binary_path,
+            "approved_sha": self.approved_sha,
+            "status": self.status,
+            "verdict_id": self.verdict_id,
+            "issued_at": self.issued_at,
+        }
+
+
 class CourtAwareRanker:
     """Ranks and scores tools based on court verification verdicts and authoritative operational telemetry."""
 

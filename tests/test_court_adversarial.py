@@ -26,6 +26,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -1689,21 +1692,68 @@ def test_gate24_true_aba_cache_poisoning_and_immutable_input_binding(hermetic_au
     assert f"ARG1={expected_inp_snap}" in probe_output, f"Argv must point to immutable input snapshot! Output: {probe_output}"
     assert f"ENV_INPUT={expected_inp_snap}" in probe_output, f"AIR10_INPUT_FILE must point to immutable input snapshot! Output: {probe_output}"
 
-    # 4. Elimination of Mutable Binary Fallback (Exit 78):
+    # 4. Elimination of Mutable Binary Fallback (Exit 78 or 79):
     snap_probe = snap_dir / probe_sha
     if snap_probe.exists():
         snap_probe.unlink()
     snap_probe.write_bytes(open(probe_script, "rb").read())
-    snap_probe.chmod(0o600)  # non-executable
+    snap_probe.chmod(0o600)  # non-executable / untrusted permissions
 
     res_no_fallback = subprocess.run(
         [c11_bin, "tr_g24_nofallback", "span_root", probe_script, inp_file],
         capture_output=True, text=True,
         env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=probe_sha)
     )
-    assert res_no_fallback.returncode == 78, f"Expected exit 78 (SNAPSHOT_EXECV_FAILED, no fallback), got {res_no_fallback.returncode}"
+    assert res_no_fallback.returncode in (78, 79), f"Expected exit 78 or 79 (fail-closed refusal, zero fallback), got {res_no_fallback.returncode}"
     snap_probe.chmod(0o700)
     snap_probe.unlink()
+
+    # 4B. True Concurrent ABA Race Injection:
+    # A background thread continuously swaps the physical disk binary between A and B
+    race_worker = str(tmp_path / "race_worker.sh")
+    with open(race_worker, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'ORIGINAL_A_OUTPUT'\nexit 0\n")
+    os.chmod(race_worker, 0o755)
+    race_sha_a = hashlib.sha256(open(race_worker, "rb").read()).hexdigest()
+
+    tampered_payload_b = b"#!/bin/sh\nprintf 'MALICIOUS_B_PAYLOAD'\nexit 0\n"
+    original_payload_a = open(race_worker, "rb").read()
+
+    stop_race = threading.Event()
+
+    def race_attacker():
+        while not stop_race.is_set():
+            try:
+                with open(race_worker, "wb") as rf:
+                    rf.write(tampered_payload_b)
+                time.sleep(0.0002)
+                with open(race_worker, "wb") as rf:
+                    rf.write(original_payload_a)
+                time.sleep(0.0002)
+            except Exception:
+                pass
+
+    attacker_thread = threading.Thread(target=race_attacker)
+    attacker_thread.daemon = True
+    attacker_thread.start()
+
+    try:
+        for idx in range(8):
+            p_race = subprocess.run(
+                [c11_bin, f"tr_g24_race_{idx}", "span_root", race_worker, inp_file],
+                capture_output=True, text=True,
+                env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=race_sha_a, AIR10_REQUIRE_EXPECTED_SHA="1")
+            )
+            # Invariant: Must NEVER execute tampered payload B!
+            if p_race.returncode == 0:
+                out_data = json.loads(p_race.stdout)
+                assert out_data["executed_binary_sha256"] == race_sha_a
+                assert "MALICIOUS_B" not in out_data.get("stdout_preview", "")
+            else:
+                assert p_race.returncode in (76, 79)
+    finally:
+        stop_race.set()
+        attacker_thread.join(timeout=1.0)
 
     # 5. Zero Execution Attestation Backfill:
     t_id_no_digest = "tr_g24_no_digest"
@@ -1860,6 +1910,204 @@ def test_gate25_autonomous_one_call_orchestration_self_healing(hermetic_audit_db
     pk_cols = [r[1] for r in conn.execute("PRAGMA table_info(tool_traces_v2)").fetchall() if r[5] > 0]
     conn.close()
     assert "trace_id" in pk_cols and "attempt_no" in pk_cols, f"Expected compound PK (trace_id, attempt_no), got {pk_cols}"
+
+
+def test_gate26_exact_court_permit_and_retry_aware_dag_reconstruction(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 26: Exact CourtExecutionPermit Binding, Mandatory Layer 4 Court SHA, and Retry-Aware Causal DAG Reconstruction."""
+    from civex.court_ranking import CourtExecutionPermit
+    from civex.orchestrator import orchestrate_request
+    from civex.trace_plumbing import air10_cross_trace_readback
+
+    c11_bin = os.environ.get("AIR10_EXEC_BOUNDARY", "/tmp/air10_exec_boundary")
+    if not os.path.isfile(c11_bin):
+        c11_bin = "/Users/rajondas/.local/bin/air10_exec_boundary"
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", c11_bin)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    cb_state_file = str(tmp_path / "g26_cb_state.json")
+    monkeypatch.setattr(CIVeXVerifier, "STATE_FILE", cb_state_file)
+
+    shim_log = str(tmp_path / "shim_g26.log")
+    monkeypatch.setenv("AIR10_SHIM_LOG", shim_log)
+    monkeypatch.setattr(air10_layer3_shim, "SHIM_LOG", shim_log)
+
+    # 1. Unpermitted binary execution under default require_court_sha=True must FAIL CLOSED
+    unregistered_bin = str(tmp_path / "unregistered_bin.sh")
+    with open(unregistered_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(unregistered_bin, 0o755)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g26_unregistered",
+            binary_path=unregistered_bin,
+            input_file=None,
+            db_path=hermetic_audit_db
+        )
+    assert "COURT_ATTESTATION_MISSING_HOLD" in str(excinfo.value)
+
+    # 2. Register two verified candidates
+    pri_bin = str(tmp_path / "g26_pri.sh")
+    with open(pri_bin, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(pri_bin, 0o755)
+    pri_sha = hashlib.sha256(open(pri_bin, "rb").read()).hexdigest()
+
+    fb_bin = str(tmp_path / "g26_fb.sh")
+    with open(fb_bin, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nfor arg do last="$arg"; done\ncat "$last"\nexit 0\n')
+    os.chmod(fb_bin, 0o755)
+    fb_sha = hashlib.sha256(open(fb_bin, "rb").read()).hexdigest()
+
+    inp_file = str(tmp_path / "g26_input.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"civex_court_gate": 26}')
+    inp_sha = hashlib.sha256(open(inp_file, "rb").read()).hexdigest()
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('g26_pri', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'COURT_CERTIFIED_PRI', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (pri_bin, pri_sha))
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path, binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('g26_fb', 'JSON_SINGLE_DOC_STRICT', 'SINGLE_DOC_STRICT_RFC8259', 'v1.0',
+                'ALLOWED', ?, ?, 'COURT_CERTIFIED_FB', NULL, NULL, '2026-09-11T00:00:00Z')
+    """, (fb_bin, fb_sha))
+
+    # Telemetry seeding
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        (trace_id, attempt_no, task_intent, traffic_class, router_candidates, chosen_tool, binary_path, binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code, duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+        VALUES ('tr_seed_g26_p', 1, 'JSON_PARSE', 'BATCH', '[]', 'g26_pri', ?, ?, ?, ?, ?, 0, 0.05, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (pri_bin, pri_sha, inp_file, inp_sha, pri_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_g26_p', 'span_seed_g26_p', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "g26_pri", "binary_path": pri_bin}),))
+
+    conn.execute("""
+        INSERT INTO tool_traces_v2
+        (trace_id, attempt_no, task_intent, traffic_class, router_candidates, chosen_tool, binary_path, binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code, duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+        VALUES ('tr_seed_g26_fb', 1, 'JSON_PARSE', 'BATCH', '[]', 'g26_fb', ?, ?, ?, ?, ?, 0, 1.20, 'EXACT_AST_MATCH', 'VERIFIED_PASS', NULL, '2026-09-11T00:00:00Z')
+    """, (fb_bin, fb_sha, inp_file, inp_sha, fb_sha))
+    conn.execute("""
+        INSERT INTO trace_events
+        (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES ('tr_seed_g26_fb', 'span_seed_g26_fb', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-11T00:00:00Z', 'sha', 'COMPLETED', ?)
+    """, (json.dumps({"tool_name": "g26_fb", "binary_path": fb_bin}),))
+    conn.commit()
+    conn.close()
+
+    # 3. Verify Layer 2 emits valid CourtExecutionPermit
+    route_res = air10_layer2_router.route_intent(
+        trace_id="tr_g26_test_route",
+        parent_span_id="span_root",
+        intent_query="test permit route",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        candidates_override=[{"name": "g26_pri", "binary": pri_bin}],
+        db_path=hermetic_audit_db
+    )
+    assert hasattr(route_res, "permit")
+    assert isinstance(route_res.permit, CourtExecutionPermit)
+    assert route_res.permit.approved_sha == pri_sha
+    assert route_res.permit.tool_name == "g26_pri"
+
+    # 4. Run closed-loop orchestration with self-healing
+    cand_pool = [
+        {"name": "g26_pri", "binary": pri_bin},
+        {"name": "g26_fb", "binary": fb_bin}
+    ]
+    res = orchestrate_request(
+        intent_query="parse strict single doc json",
+        required_capability="JSON_SINGLE_DOC_STRICT",
+        input_file=inp_file,
+        candidate_pool=cand_pool,
+        db_path=hermetic_audit_db,
+        max_attempts=2,
+        output_dir=str(tmp_path)
+    )
+    assert res["status"] == "SUCCESS"
+    assert res["chosen_tool"] == "g26_fb"
+    assert res["attempts_needed"] == 2
+    t_id = res["trace_id"]
+
+    # 5. Causal DAG Validator: Validate multi-attempt healed trace
+    dag_ok = air10_cross_trace_readback.validate_and_readback(
+        trace_id=t_id,
+        db_path=hermetic_audit_db,
+        shim_log=shim_log
+    )
+    assert dag_ok is True
+
+
+def test_gate27_randomized_concurrent_stress_loop(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 27: Randomized Concurrent Race Stress-Loop Testing Anti-Poisoning & Fail-Closed Integrity."""
+    c11_bin = os.environ.get("AIR10_EXEC_BOUNDARY", "/tmp/air10_exec_boundary")
+    if not os.path.isfile(c11_bin):
+        c11_bin = "/Users/rajondas/.local/bin/air10_exec_boundary"
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", c11_bin)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    stress_worker = str(tmp_path / "stress_worker.sh")
+    with open(stress_worker, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'STRESS_ORIGINAL_OUTPUT'\nexit 0\n")
+    os.chmod(stress_worker, 0o755)
+    stress_sha = hashlib.sha256(open(stress_worker, "rb").read()).hexdigest()
+
+    inp_file = str(tmp_path / "stress_inp.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"stress": true}')
+
+    stop_stress = threading.Event()
+    race_payload = b"#!/bin/sh\nprintf 'POISONED_RACE_STRESS'\nexit 0\n"
+    orig_payload = open(stress_worker, "rb").read()
+
+    def stress_adversary():
+        while not stop_stress.is_set():
+            try:
+                with open(stress_worker, "wb") as f:
+                    f.write(race_payload)
+                time.sleep(0.0001)
+                with open(stress_worker, "wb") as f:
+                    f.write(orig_payload)
+                time.sleep(0.0001)
+            except Exception:
+                pass
+
+    t_adv = threading.Thread(target=stress_adversary)
+    t_adv.daemon = True
+    t_adv.start()
+
+    passed_count = 0
+    refused_count = 0
+
+    try:
+        for i in range(16):
+            t_id = f"tr_stress_{i}_{uuid.uuid4().hex[:6]}"
+            proc = subprocess.run(
+                [c11_bin, t_id, "span_root", stress_worker, inp_file],
+                capture_output=True, text=True,
+                env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=stress_sha, AIR10_REQUIRE_EXPECTED_SHA="1")
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                assert data["executed_binary_sha256"] == stress_sha
+                assert "POISONED_RACE" not in data.get("stdout_preview", "")
+                passed_count += 1
+            else:
+                assert proc.returncode in (76, 79)
+                refused_count += 1
+    finally:
+        stop_stress.set()
+        t_adv.join(timeout=1.0)
+
+    # Assert that all runs either executed genuine bytes A or safely refused with 76/79 (zero corrupt executions)
+    assert (passed_count + refused_count) == 16
 
 
 
