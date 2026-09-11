@@ -121,23 +121,6 @@ static void hash_to_hex(const uint8_t hash[32], char hex_out[65]) {
     hex_out[64] = '\0';
 }
 
-static int compute_file_sha256(const char *path, char hex_out[65]) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    SHA256_CTX ctx;
-    sha256_init(&ctx);
-    uint8_t buf[8192];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        sha256_update(&ctx, buf, (size_t)n);
-    }
-    close(fd);
-    if (n < 0) return -1;
-    uint8_t hash[32];
-    sha256_final(&ctx, hash);
-    hash_to_hex(hash, hex_out);
-    return 0;
-}
 
 static double timespec_to_ms(struct timespec ts) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
@@ -235,6 +218,14 @@ int main(int argc, char *argv[]) {
 
     /* Expected Binary SHA verification (Fail-Closed) */
     const char *expected_bin_sha = getenv("AIR10_EXPECTED_BINARY_SHA");
+    const char *require_bin_sha = getenv("AIR10_REQUIRE_EXPECTED_SHA");
+    if (require_bin_sha && (require_bin_sha[0] == '1' || strcasecmp(require_bin_sha, "true") == 0)) {
+        if (!expected_bin_sha || expected_bin_sha[0] == '\0') {
+            fprintf(stderr, "ERROR: MANDATORY_EXPECTED_BINARY_SHA_MISSING: AIR10_EXPECTED_BINARY_SHA required but not set\n");
+            free(bin_bytes);
+            return 76;
+        }
+    }
     if (expected_bin_sha && expected_bin_sha[0] != '\0') {
         if (strcasecmp(executed_binary_sha256, expected_bin_sha) != 0) {
             fprintf(stderr, "ERROR: BINARY_INTEGRITY_MISMATCH: executed SHA '%s' != expected SHA '%s'\n", executed_binary_sha256, expected_bin_sha);
@@ -245,7 +236,7 @@ int main(int argc, char *argv[]) {
 
     /* Content-Addressed Execution Snapshot:
      * Write exact bytes read & verified to /tmp/air10_exec_snapshots/<sha256>
-     * with permissions 0700. This guarantees child executes the exact verified bytes.
+     * with permissions 0700. If snapshot already exists, verify its bytes and ownership (Anti-Poisoning).
      * Completely eliminates time-of-check-to-time-of-use (TOCTOU) and ABA mutation attacks.
      */
     char snapshot_path[512];
@@ -254,33 +245,185 @@ int main(int argc, char *argv[]) {
     int snap_fd = open(snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0700);
     if (snap_fd >= 0) {
         size_t written_total = 0;
+        int write_err = 0;
         while (written_total < bin_len) {
             ssize_t w = write(snap_fd, bin_bytes + written_total, bin_len - written_total);
             if (w < 0) {
                 if (errno == EINTR) continue;
+                write_err = 1;
                 break;
             }
             written_total += (size_t)w;
         }
+        if (write_err || written_total < bin_len) {
+            unlink(snapshot_path);
+            close(snap_fd);
+            free(bin_bytes);
+            fprintf(stderr, "ERROR: Failed to write snapshot completely\n");
+            return 71;
+        }
+        if (fsync(snap_fd) != 0) {
+            unlink(snapshot_path);
+            close(snap_fd);
+            free(bin_bytes);
+            fprintf(stderr, "ERROR: Failed to fsync snapshot\n");
+            return 71;
+        }
         close(snap_fd);
         chmod(snapshot_path, 0700);
+    } else if (errno == EEXIST) {
+        /* Pre-existing snapshot: verify ownership and re-hash all bytes (Anti-Poisoning) */
+        int exist_fd = open(snapshot_path, O_RDONLY);
+        if (exist_fd < 0) {
+            free(bin_bytes);
+            fprintf(stderr, "ERROR: Cannot open existing snapshot for verification: %s\n", strerror(errno));
+            return 79;
+        }
+        struct stat st;
+        if (fstat(exist_fd, &st) != 0) {
+            close(exist_fd);
+            free(bin_bytes);
+            return 79;
+        }
+        if (st.st_uid != getuid()) {
+            close(exist_fd);
+            free(bin_bytes);
+            fprintf(stderr, "ERROR: SNAPSHOT_OWNERSHIP_MISMATCH: owner %d != current uid %d\n", (int)st.st_uid, (int)getuid());
+            return 79;
+        }
+        char exist_sha[65] = {0};
+        SHA256_CTX exist_ctx;
+        sha256_init(&exist_ctx);
+        uint8_t ebuf[8192];
+        ssize_t en;
+        while ((en = read(exist_fd, ebuf, sizeof(ebuf))) > 0) {
+            sha256_update(&exist_ctx, ebuf, (size_t)en);
+        }
+        close(exist_fd);
+        if (en < 0) {
+            free(bin_bytes);
+            return 79;
+        }
+        uint8_t e_hash[32];
+        sha256_final(&exist_ctx, e_hash);
+        hash_to_hex(e_hash, exist_sha);
+        if (strcasecmp(exist_sha, executed_binary_sha256) != 0) {
+            fprintf(stderr, "ERROR: SNAPSHOT_CACHE_POISONED: existing snapshot SHA '%s' != expected SHA '%s'\n", exist_sha, executed_binary_sha256);
+            free(bin_bytes);
+            return 79;
+        }
+    } else {
+        free(bin_bytes);
+        fprintf(stderr, "ERROR: Failed to create or access snapshot path '%s': %s\n", snapshot_path, strerror(errno));
+        return 71;
     }
     free(bin_bytes);
 
-    /* 2. If input file is specified and exists, compute authoritative C11 executed_input_sha256 */
+    /* 2. If input file is specified and exists, compute authoritative C11 executed_input_sha256 and create immutable input snapshot */
     char executed_input_sha256[65] = {0};
+    char input_snapshot_path[512] = {0};
     if (strlen(input_file) > 0 && access(input_file, F_OK) == 0) {
-        if (compute_file_sha256(input_file, executed_input_sha256) != 0) {
-            fprintf(stderr, "ERROR: Failed to hash input file '%s'\n", input_file);
+        int inp_fd = open(input_file, O_RDONLY);
+        if (inp_fd < 0) {
+            fprintf(stderr, "ERROR: Failed to open input file '%s'\n", input_file);
             return 72;
         }
+        SHA256_CTX inp_ctx;
+        sha256_init(&inp_ctx);
+        size_t inp_cap = 65536;
+        size_t inp_len = 0;
+        uint8_t *inp_bytes = (uint8_t *)malloc(inp_cap);
+        if (!inp_bytes) { close(inp_fd); return 71; }
+        uint8_t ibuf[8192];
+        ssize_t in_n;
+        while ((in_n = read(inp_fd, ibuf, sizeof(ibuf))) > 0) {
+            sha256_update(&inp_ctx, ibuf, (size_t)in_n);
+            while (inp_len + (size_t)in_n > inp_cap) {
+                inp_cap *= 2;
+                uint8_t *nb = (uint8_t *)realloc(inp_bytes, inp_cap);
+                if (!nb) { free(inp_bytes); close(inp_fd); return 71; }
+                inp_bytes = nb;
+            }
+            memcpy(inp_bytes + inp_len, ibuf, (size_t)in_n);
+            inp_len += (size_t)in_n;
+        }
+        close(inp_fd);
+        if (in_n < 0) { free(inp_bytes); return 71; }
+        uint8_t inp_hash[32];
+        sha256_final(&inp_ctx, inp_hash);
+        hash_to_hex(inp_hash, executed_input_sha256);
+
         const char *expected_inp_sha = getenv("AIR10_EXPECTED_INPUT_SHA");
         if (expected_inp_sha && expected_inp_sha[0] != '\0') {
             if (strcasecmp(executed_input_sha256, expected_inp_sha) != 0) {
                 fprintf(stderr, "ERROR: INPUT_INTEGRITY_MISMATCH: input file SHA '%s' != expected '%s'\n", executed_input_sha256, expected_inp_sha);
+                free(inp_bytes);
                 return 77;
             }
         }
+
+        /* Create immutable input snapshot in /tmp/air10_input_snapshots */
+        const char *inp_snap_dir = getenv("AIR10_INPUT_SNAPSHOT_DIR");
+        if (!inp_snap_dir || inp_snap_dir[0] == '\0') {
+            inp_snap_dir = "/tmp/air10_input_snapshots";
+        }
+        mkdir(inp_snap_dir, 0700);
+        snprintf(input_snapshot_path, sizeof(input_snapshot_path), "%s/in_%s", inp_snap_dir, executed_input_sha256);
+
+        int in_snap_fd = open(input_snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (in_snap_fd >= 0) {
+            size_t in_w_total = 0;
+            int in_w_err = 0;
+            while (in_w_total < inp_len) {
+                ssize_t iw = write(in_snap_fd, inp_bytes + in_w_total, inp_len - in_w_total);
+                if (iw < 0) {
+                    if (errno == EINTR) continue;
+                    in_w_err = 1;
+                    break;
+                }
+                in_w_total += (size_t)iw;
+            }
+            if (in_w_err || in_w_total < inp_len) {
+                unlink(input_snapshot_path);
+                close(in_snap_fd);
+                free(inp_bytes);
+                return 71;
+            }
+            fsync(in_snap_fd);
+            close(in_snap_fd);
+            chmod(input_snapshot_path, 0600);
+        } else if (errno == EEXIST) {
+            int ex_in_fd = open(input_snapshot_path, O_RDONLY);
+            if (ex_in_fd < 0) {
+                free(inp_bytes);
+                return 79;
+            }
+            struct stat inst;
+            if (fstat(ex_in_fd, &inst) != 0 || inst.st_uid != getuid()) {
+                close(ex_in_fd);
+                free(inp_bytes);
+                return 79;
+            }
+            char ex_in_sha[65] = {0};
+            SHA256_CTX ex_ictx;
+            sha256_init(&ex_ictx);
+            uint8_t ex_ibuf[8192];
+            ssize_t ex_in;
+            while ((ex_in = read(ex_in_fd, ex_ibuf, sizeof(ex_ibuf))) > 0) {
+                sha256_update(&ex_ictx, ex_ibuf, (size_t)ex_in);
+            }
+            close(ex_in_fd);
+            if (ex_in < 0) { free(inp_bytes); return 79; }
+            uint8_t ex_ihash[32];
+            sha256_final(&ex_ictx, ex_ihash);
+            hash_to_hex(ex_ihash, ex_in_sha);
+            if (strcasecmp(ex_in_sha, executed_input_sha256) != 0) {
+                fprintf(stderr, "ERROR: INPUT_SNAPSHOT_POISONED: existing input snapshot SHA '%s' != expected '%s'\n", ex_in_sha, executed_input_sha256);
+                free(inp_bytes);
+                return 79;
+            }
+        }
+        free(inp_bytes);
     }
 
     /* Optional stdout preservation path from environment */
@@ -336,6 +479,16 @@ int main(int argc, char *argv[]) {
         child_argc = argc - 3;
         child_args[child_argc] = NULL;
 
+        /* Rewrite any argument matching original input_file to immutable input_snapshot_path */
+        if (input_snapshot_path[0] != '\0') {
+            for (int i = 1; i < child_argc; i++) {
+                if (child_args[i] && strcmp(child_args[i], input_file) == 0) {
+                    child_args[i] = input_snapshot_path;
+                }
+            }
+            setenv("AIR10_INPUT_FILE", input_snapshot_path, 1);
+        }
+
         /* If system binary in read-only SIP path on macOS, execute directly */
         int is_sys_bin = 0;
 #ifdef __APPLE__
@@ -352,14 +505,11 @@ int main(int argc, char *argv[]) {
         } else {
             child_args[0] = (char *)snapshot_path;
             execv(snapshot_path, child_args);
-
-            /* If execv fails on snapshot, fallback to binary_path directly */
-            child_args[0] = (char *)binary_path;
-            execv(binary_path, child_args);
         }
 
+        /* FAIL CLOSED: Zero fallback to mutable binary_path */
         perror("execv");
-        _exit(127);
+        _exit(78);
     }
 
     /* Parent Process: Supervisor */

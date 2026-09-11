@@ -73,7 +73,7 @@ def canonical_ast_digest(obj):
     canon_bytes = json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(canon_bytes).hexdigest(), canon_bytes
 
-def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
+def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None, attempt_no=1):
     span_id = f"span_verifier_{uuid.uuid4().hex[:8]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     active_db = audit_db_path or os.environ.get("AIR10_AUDIT_DB") or DB_PATH
@@ -292,22 +292,37 @@ def verify_trace(trace_id, target_stdout_file=None, audit_db_path=None):
     """, (trace_id, span_id, parent_exec_span, now_iso, payload_sha256, verdict_status, json.dumps(details)))
 
     # Append immutable summary to tool_traces_v2 (Physical 64-char SHA-256 digests or NULL, zero synthetic sentinels)
+    # Append immutable summary to tool_traces_v2 (Physical 64-char SHA-256 digests or NULL, zero synthetic sentinels)
     task_intent = intent_info.get("details", {}).get("intent", "UNKNOWN_INTENT")
     router_details = router_info.get("details", {})
     chosen_tool = router_details.get("chosen_tool", target_bin)
     candidates_json = json.dumps(router_details.get("candidates", []))
 
-    cur.execute("""
-        INSERT INTO tool_traces_v2
-        (trace_id, task_intent, traffic_class, router_candidates, chosen_tool, binary_path, 
-         binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code, 
-         duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
-        VALUES (?, ?, 'TASK_CLI_HOTPATH', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        trace_id, task_intent, candidates_json, chosen_tool, target_bin,
-        binary_sha256, input_file, input_sha256, stdout_sha256, actual_returncode,
-        duration_ms, semantic_result, verdict_status, failure_reason, now_iso
-    ))
+    cols = [c[1] for c in cur.execute("PRAGMA table_info(tool_traces_v2)").fetchall()]
+    if "attempt_no" in cols:
+        cur.execute("""
+            INSERT INTO tool_traces_v2
+            (trace_id, attempt_no, task_intent, traffic_class, router_candidates, chosen_tool, binary_path, 
+             binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code, 
+             duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+            VALUES (?, ?, ?, 'TASK_CLI_HOTPATH', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trace_id, attempt_no, task_intent, candidates_json, chosen_tool, target_bin,
+            binary_sha256, input_file, input_sha256, stdout_sha256, actual_returncode,
+            duration_ms, semantic_result, verdict_status, failure_reason, now_iso
+        ))
+    else:
+        cur.execute("""
+            INSERT INTO tool_traces_v2
+            (trace_id, task_intent, traffic_class, router_candidates, chosen_tool, binary_path, 
+             binary_sha256, input_path, input_sha256, stdout_sha256, actual_exit_code, 
+             duration_ms, semantic_equivalence, verification_status, failure_reason, created_at)
+            VALUES (?, ?, 'TASK_CLI_HOTPATH', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trace_id, task_intent, candidates_json, chosen_tool, target_bin,
+            binary_sha256, input_file, input_sha256, stdout_sha256, actual_returncode,
+            duration_ms, semantic_result, verdict_status, failure_reason, now_iso
+        ))
 
     conn.commit()
     conn.close()
