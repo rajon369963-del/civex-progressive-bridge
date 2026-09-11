@@ -5,6 +5,13 @@ import pytest
 from civex.trace_plumbing.air10_layer4_executor import execute_process
 
 
+def test_missing_key_cannot_mint_permit(monkeypatch):
+    from civex.court_ranking import CourtExecutionPermit
+    monkeypatch.delenv('AIR10_COURT_SECRET_KEY', raising=False)
+    with pytest.raises(ValueError, match='AUTHORITY_KEY_UNAVAILABLE'):
+        CourtExecutionPermit.issue('tool', 'cap', 'json', 'v1', '/bin/echo', 'a' * 64)
+
+
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(0o755)

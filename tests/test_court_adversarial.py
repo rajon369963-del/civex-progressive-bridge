@@ -1639,7 +1639,7 @@ def test_gate24_true_aba_cache_poisoning_and_immutable_input_binding(hermetic_au
         contract_version="v1.0",
         binary_path=tool_bin,
         approved_sha=tampered_expected_sha,
-        secret_key="air10_sovereign_court_master_secret_v9",
+        secret_key=os.environ["AIR10_COURT_SECRET_KEY"],
     )
     with pytest.raises(RuntimeError) as exc_info:
         air10_layer4_executor.execute_process(
@@ -2173,7 +2173,7 @@ def test_gate28_permit_authenticity_and_sha_bypass_rejection(hermetic_audit_db, 
         contract_version="v1.0.0",
         binary_path=g28_worker,
         approved_sha=g28_sha,
-        secret_key="air10_sovereign_court_master_secret_v9",
+        secret_key=os.environ["AIR10_COURT_SECRET_KEY"],
     )
     forged_permit = CourtExecutionPermit(
         permit_id=genuine_permit.permit_id,
@@ -2208,7 +2208,7 @@ def test_gate28_permit_authenticity_and_sha_bypass_rejection(hermetic_audit_db, 
         binary_path=g28_worker,
         approved_sha=g28_sha,
         ttl_sec=-3600,
-        secret_key="air10_sovereign_court_master_secret_v9",
+        secret_key=os.environ["AIR10_COURT_SECRET_KEY"],
     )
     with pytest.raises(RuntimeError) as exc_exp:
         air10_layer4_executor.execute_process(
@@ -2353,7 +2353,7 @@ sleep 100
         contract_version="v1.0.0",
         binary_path=g30_worker,
         approved_sha=g30_sha,
-        secret_key="air10_sovereign_court_master_secret_v9",
+        secret_key=os.environ["AIR10_COURT_SECRET_KEY"],
     )
 
     with pytest.raises(subprocess.TimeoutExpired):
