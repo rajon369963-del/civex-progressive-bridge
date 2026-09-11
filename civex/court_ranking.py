@@ -20,11 +20,13 @@ where:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -46,6 +48,9 @@ class ToolScoreBreakdown:
     superseded_by: str | None = None
 
 
+COURT_SECRET_KEY = os.environ.get("AIR10_COURT_SECRET_KEY", "air10_sovereign_court_master_secret_v9")
+
+
 @dataclass(frozen=True)
 class CourtExecutionPermit:
     permit_id: str
@@ -58,6 +63,58 @@ class CourtExecutionPermit:
     status: str
     verdict_id: str | None = None
     issued_at: str = ""
+    expires_at: str = ""
+    nonce: str = ""
+    signature: str = ""
+
+    def canonical_bytes(self) -> bytes:
+        payload = (
+            f"{self.permit_id}|{self.tool_name}|{self.capability}|{self.input_format}|"
+            f"{self.contract_version}|{self.binary_path}|{self.approved_sha}|{self.status}|"
+            f"{self.verdict_id or ''}|{self.issued_at}|{self.expires_at}|{self.nonce}"
+        )
+        return payload.encode("utf-8")
+
+    @classmethod
+    def issue(
+        cls,
+        tool_name: str,
+        capability: str,
+        input_format: str,
+        contract_version: str,
+        binary_path: str,
+        approved_sha: str,
+        verdict_id: str | None = None,
+        ttl_sec: int = 3600,
+        secret_key: str | None = None,
+    ) -> CourtExecutionPermit:
+        now = datetime.now(timezone.utc)
+        issued_at = now.isoformat()
+        expires_at = (now + timedelta(seconds=ttl_sec)).isoformat()
+        permit_id = f"permit_{uuid.uuid4().hex[:12]}"
+        nonce = uuid.uuid4().hex[:8]
+        key = (secret_key or COURT_SECRET_KEY).encode("utf-8")
+        raw = (
+            f"{permit_id}|{tool_name}|{capability}|{input_format}|"
+            f"{contract_version}|{binary_path}|{approved_sha}|ELIGIBLE|"
+            f"{verdict_id or ''}|{issued_at}|{expires_at}|{nonce}"
+        ).encode()
+        sig = hmac.new(key, raw, hashlib.sha256).hexdigest()
+        return cls(
+            permit_id=permit_id,
+            tool_name=tool_name,
+            capability=capability,
+            input_format=input_format,
+            contract_version=contract_version,
+            binary_path=binary_path,
+            approved_sha=approved_sha,
+            status="ELIGIBLE",
+            verdict_id=verdict_id,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            nonce=nonce,
+            signature=sig,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,7 +128,90 @@ class CourtExecutionPermit:
             "status": self.status,
             "verdict_id": self.verdict_id,
             "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "nonce": self.nonce,
+            "signature": self.signature,
         }
+
+
+def verify_permit(
+    permit: Any,
+    db_path: str | None = None,
+    secret_key: str | None = None,
+    required_capability: str | None = None,
+) -> tuple[bool, str]:
+    """Cryptographically verifies authenticity, integrity, validity period, and DB contract verdict of a CourtExecutionPermit.
+    FAIL-CLOSED INVARIANT: Any tampering, forge attempt, expiration, or contract quarantine returns False.
+    """
+    if not isinstance(permit, CourtExecutionPermit):
+        return False, "INVALID_PERMIT_TYPE: Object is not an authentic CourtExecutionPermit instance"
+    if not permit.signature:
+        return False, "PERMIT_SIGNATURE_MISSING: Permit contains no cryptographic signature"
+
+    key = (secret_key or COURT_SECRET_KEY).encode("utf-8")
+    expected_sig = hmac.new(key, permit.canonical_bytes(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(permit.signature, expected_sig):
+        return False, "PERMIT_SIGNATURE_FORGED: Cryptographic signature mismatch (tampered or forged permit)"
+
+    # Check capability if required
+    if required_capability and permit.capability != required_capability:
+        return False, f"PERMIT_CAPABILITY_MISMATCH: Permit capability '{permit.capability}' != required '{required_capability}'"
+
+    # Check expiry
+    try:
+        now = datetime.now(timezone.utc)
+        exp = datetime.fromisoformat(permit.expires_at.replace("Z", "+00:00"))
+        if now > exp:
+            return False, f"PERMIT_EXPIRED: Permit expired at {permit.expires_at}"
+    except Exception as e:
+        return False, f"PERMIT_TIMESTAMP_INVALID: Cannot parse expires_at timestamp: {e}"
+
+    # Verify against audit DB if provided
+    active_db = db_path or os.environ.get("AIR10_AUDIT_DB")
+    if active_db and os.path.exists(active_db):
+        try:
+            conn = sqlite3.connect(f"file:{active_db}?mode=ro", uri=True)
+            cur = conn.cursor()
+            cols = [c[1] for c in cur.execute("PRAGMA table_info(tool_contract_verdicts_v2)").fetchall()]
+            has_is_quarantined = "is_quarantined" in cols
+            if has_is_quarantined:
+                cur.execute(
+                    """SELECT status, is_quarantined, binary_sha256 
+                       FROM tool_contract_verdicts_v2 
+                       WHERE tool_name = ? AND capability = ? AND input_format = ? AND contract_version = ?
+                       LIMIT 1""",
+                    (permit.tool_name, permit.capability, permit.input_format, permit.contract_version),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, f"PERMIT_CONTRACT_UNKNOWN: No matching contract in Court DB for {permit.tool_name} / {permit.capability}"
+                v_status, is_quarantined, v_sha = row
+                if is_quarantined or v_status in ("QUARANTINED", "REJECTED"):
+                    return False, f"PERMIT_CONTRACT_QUARANTINED: Tool contract '{permit.tool_name}' is quarantined in Court DB"
+            else:
+                cur.execute(
+                    """SELECT status, binary_sha256 
+                       FROM tool_contract_verdicts_v2 
+                       WHERE tool_name = ? AND capability = ? AND input_format = ? AND contract_version = ?
+                       LIMIT 1""",
+                    (permit.tool_name, permit.capability, permit.input_format, permit.contract_version),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, f"PERMIT_CONTRACT_UNKNOWN: No matching contract in Court DB for {permit.tool_name} / {permit.capability}"
+                v_status, v_sha = row
+                if v_status in ("QUARANTINED", "REJECTED"):
+                    return False, f"PERMIT_CONTRACT_QUARANTINED: Tool contract '{permit.tool_name}' is quarantined in Court DB"
+
+            conn.close()
+            if v_status not in ("ALLOWED", "VERIFIED_CORRECT", "ELIGIBLE"):
+                return False, f"PERMIT_CONTRACT_NOT_ALLOWED: Contract verdict is '{v_status}'"
+            if v_sha and v_sha != permit.approved_sha:
+                return False, f"PERMIT_SHA_MISMATCH: Permit approved_sha '{permit.approved_sha}' != Court DB verified sha '{v_sha}'"
+        except Exception as e:
+            return False, f"PERMIT_DB_VERIFICATION_FAILED: {e}"
+
+    return True, "PERMIT_VERIFIED"
 
 
 class CourtAwareRanker:

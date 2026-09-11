@@ -192,16 +192,13 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
         except Exception:
             from court_ranking import CourtExecutionPermit
 
-        permit = CourtExecutionPermit(
-            permit_id=f"permit_{uuid.uuid4().hex[:12]}",
+        permit = CourtExecutionPermit.issue(
             tool_name=chosen_tool,
             capability=required_capability,
             input_format=input_format,
             contract_version=contract_version,
             binary_path=chosen_binary,
             approved_sha=approved_sha,
-            status="ELIGIBLE",
-            issued_at=now_iso
         )
 
     # 3. Correlation payload & hash
@@ -245,6 +242,32 @@ class RouteResult(tuple):
         inst.span_id = span_id
         inst.permit = permit
         return inst
+
+
+def record_routing(trace_id, parent_span_id, chosen_tool, candidates=None, db_path=None):
+    span_id = f"span_router_{uuid.uuid4().hex[:8]}"
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    active_db = db_path or os.environ.get("AIR10_AUDIT_DB", DB_PATH)
+    details = {
+        "chosen_tool": chosen_tool,
+        "candidates": candidates or [],
+        "routing_engine": "record_routing",
+    }
+    payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
+    payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
+
+    if os.path.exists(active_db):
+        conn = sqlite3.connect(active_db)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trace_events 
+            (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+            VALUES (?, ?, ?, 'ROUTER_EVALUATION', 'civex-court-router', ?, ?, 'EVALUATED', ?)
+        """, (trace_id, span_id, parent_span_id, now_iso, payload_sha256, json.dumps(details)))
+        conn.commit()
+        conn.close()
+
+    return span_id
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:

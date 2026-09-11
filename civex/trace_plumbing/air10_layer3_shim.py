@@ -65,8 +65,22 @@ def shim_intercept(trace_id, tool_name, binary_path, command_args, parent_span_i
         conn.commit()
         conn.close()
 
-    print(span_id)
+    print(f"SHIM_INTERCEPT_CAPTURED|SPAN_ID={span_id}|TARGET={binary_path}")
     return span_id
+
+
+def record_shim_intercept(trace_id, parent_span_id, target_bin, parent_pid=None, db_path=None, shim_log=None):
+    """Helper alias for recording shim intercepts in test and orchestrator workflows."""
+    return shim_intercept(
+        trace_id=trace_id,
+        tool_name=os.path.basename(target_bin),
+        binary_path=target_bin,
+        command_args=[target_bin],
+        parent_span_id=parent_span_id,
+        db_path=db_path,
+        shim_log=shim_log,
+    )
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:

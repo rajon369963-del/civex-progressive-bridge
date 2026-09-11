@@ -33,8 +33,9 @@ from pathlib import Path
 
 import pytest
 from civex.bridge import CIVeXVerifier, ProgressiveToolBridge
-from civex.court_ranking import CourtAwareRanker
+from civex.court_ranking import CourtAwareRanker, CourtExecutionPermit
 from civex.trace_plumbing import (
+    air10_cross_trace_readback,
     air10_layer1_intent,
     air10_layer2_router,
     air10_layer3_shim,
@@ -1117,7 +1118,6 @@ def test_gate21_full_5_layer_dag_reality_test(hermetic_audit_db, tmp_path, monke
     Asserts strict causal parent-child span DAG linkages, payload hashes, and cross-trace readback verification.
     """
     from civex.trace_plumbing import (
-        air10_cross_trace_readback,
         air10_layer4_executor,
         air10_layer5_verifier,
     )
@@ -1628,9 +1628,19 @@ def test_gate24_true_aba_cache_poisoning_and_immutable_input_binding(hermetic_au
     conn.commit()
     conn.close()
 
+    out_fail = str(tmp_path / "g24_out_fail.json")
+
     # If Court SHA does not match actual binary, Layer 4 / C11 must fail closed with exit code 76
     tampered_expected_sha = "e" * 64
-    out_fail = str(tmp_path / "out_fail.json")
+    permit_mismatch = CourtExecutionPermit.issue(
+        tool_name="g24_tool",
+        capability="JSON_PARSE",
+        input_format="SINGLE_DOC_STRICT_RFC8259",
+        contract_version="v1.0",
+        binary_path=tool_bin,
+        approved_sha=tampered_expected_sha,
+        secret_key="air10_sovereign_court_master_secret_v9",
+    )
     with pytest.raises(RuntimeError) as exc_info:
         air10_layer4_executor.execute_process(
             trace_id="tr_g24_mismatch",
@@ -1639,9 +1649,10 @@ def test_gate24_true_aba_cache_poisoning_and_immutable_input_binding(hermetic_au
             output_file=out_fail,
             expected_binary_sha=tampered_expected_sha,
             require_court_sha=True,
+            permit=permit_mismatch,
             db_path=hermetic_audit_db
         )
-    assert "exit 76" in str(exc_info.value) or "PRE_EXEC_BINARY_TAMPERED" in str(exc_info.value)
+    assert "exit 76" in str(exc_info.value) or "PRE_EXEC_BINARY_TAMPERED" in str(exc_info.value) or "PERMIT_SHA_MISMATCH" in str(exc_info.value)
 
     # 2. Poisoned Snapshot Cache Refusal (Exit 79):
     snap_dir = Path("/tmp/air10_exec_snapshots")
@@ -1914,7 +1925,6 @@ def test_gate25_autonomous_one_call_orchestration_self_healing(hermetic_audit_db
 
 def test_gate26_exact_court_permit_and_retry_aware_dag_reconstruction(hermetic_audit_db, tmp_path, monkeypatch):
     """Gate 26: Exact CourtExecutionPermit Binding, Mandatory Layer 4 Court SHA, and Retry-Aware Causal DAG Reconstruction."""
-    from civex.court_ranking import CourtExecutionPermit
     from civex.orchestrator import orchestrate_request
     from civex.trace_plumbing import air10_cross_trace_readback
 
@@ -2108,6 +2118,509 @@ def test_gate27_randomized_concurrent_stress_loop(hermetic_audit_db, tmp_path, m
 
     # Assert that all runs either executed genuine bytes A or safely refused with 76/79 (zero corrupt executions)
     assert (passed_count + refused_count) == 16
+
+
+def test_gate28_permit_authenticity_and_sha_bypass_rejection(hermetic_audit_db, tmp_path):
+    """Gate 28: Non-Forgeable CourtExecutionPermit & Layer 4 Gating.
+    1. Forged HMAC signature is rejected with PERMIT_AUTHENTICITY_VERIFICATION_FAILED_HOLD.
+    2. Missing permit when require_court_sha=True is rejected with COURT_PERMIT_REQUIRED_HOLD.
+    3. Expired permit is rejected with PERMIT_EXPIRED.
+    4. Quarantined tool permit is rejected with TOOL_QUARANTINED_HOLD.
+    5. Valid permit passes execution.
+    """
+    g28_worker = str(tmp_path / "g28_worker.sh")
+    with open(g28_worker, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'G28_SUCCESS_OUTPUT'\nexit 0\n")
+    os.chmod(g28_worker, 0o755)
+    g28_sha = hashlib.sha256(open(g28_worker, "rb").read()).hexdigest()
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path,
+         binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('g28_tool', 'CLI_HOTPATH', 'JSON', 'v1.0.0', 'ALLOWED', ?, ?, 'APPROVED', NULL, NULL, datetime('now'))
+    """, (g28_worker, g28_sha))
+    conn.commit()
+    conn.close()
+
+    inp_file = str(tmp_path / "g28_inp.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"g28": true}')
+
+    # 1. Bypass attempt: provide expected_binary_sha without permit
+    with pytest.raises(RuntimeError) as exc_bypass:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g28_bypass",
+            parent_span_id="span_parent",
+            target_bin=g28_worker,
+            input_file=inp_file,
+            audit_db=hermetic_audit_db,
+            expected_binary_sha=g28_sha,
+            require_court_sha=True,
+            permit=None,
+        )
+    assert "COURT_PERMIT_REQUIRED_HOLD" in str(exc_bypass.value)
+
+    # 2. Forged signature permit
+    genuine_permit = CourtExecutionPermit.issue(
+        tool_name="g28_tool",
+        capability="CLI_HOTPATH",
+        input_format="JSON",
+        contract_version="v1.0.0",
+        binary_path=g28_worker,
+        approved_sha=g28_sha,
+        secret_key="air10_sovereign_court_master_secret_v9",
+    )
+    forged_permit = CourtExecutionPermit(
+        permit_id=genuine_permit.permit_id,
+        tool_name=genuine_permit.tool_name,
+        capability=genuine_permit.capability,
+        input_format=genuine_permit.input_format,
+        contract_version=genuine_permit.contract_version,
+        binary_path=genuine_permit.binary_path,
+        approved_sha=genuine_permit.approved_sha,
+        status="ELIGIBLE",
+        signature="deadbeefbadcafef00d1234567890abcdefdeadbeefbadcafef00d1234567890abc",
+    )
+    with pytest.raises(RuntimeError) as exc_forge:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g28_forge",
+            parent_span_id="span_parent",
+            target_bin=g28_worker,
+            input_file=inp_file,
+            audit_db=hermetic_audit_db,
+            require_court_sha=True,
+            permit=forged_permit,
+        )
+    assert "PERMIT_AUTHENTICITY_VERIFICATION_FAILED_HOLD" in str(exc_forge.value)
+    assert "PERMIT_SIGNATURE_FORGED" in str(exc_forge.value)
+
+    # 3. Expired permit
+    expired_permit = CourtExecutionPermit.issue(
+        tool_name="g28_tool",
+        capability="CLI_HOTPATH",
+        input_format="JSON",
+        contract_version="v1.0.0",
+        binary_path=g28_worker,
+        approved_sha=g28_sha,
+        ttl_sec=-3600,
+        secret_key="air10_sovereign_court_master_secret_v9",
+    )
+    with pytest.raises(RuntimeError) as exc_exp:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g28_exp",
+            parent_span_id="span_parent",
+            target_bin=g28_worker,
+            input_file=inp_file,
+            audit_db=hermetic_audit_db,
+            require_court_sha=True,
+            permit=expired_permit,
+        )
+    assert "PERMIT_EXPIRED" in str(exc_exp.value)
+
+    # 4. Quarantined tool permit
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("UPDATE tool_contract_verdicts_v2 SET status='QUARANTINED', reason='QUARANTINED' WHERE tool_name='g28_tool'")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError) as exc_quar:
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g28_quar",
+            parent_span_id="span_parent",
+            target_bin=g28_worker,
+            input_file=inp_file,
+            audit_db=hermetic_audit_db,
+            require_court_sha=True,
+            permit=genuine_permit,
+        )
+    assert "PERMIT_CONTRACT_QUARANTINED" in str(exc_quar.value) or "TOOL_QUARANTINED_HOLD" in str(exc_quar.value)
+
+    # 5. Restore active and execute cleanly with genuine permit
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("UPDATE tool_contract_verdicts_v2 SET status='ALLOWED', reason='APPROVED' WHERE tool_name='g28_tool'")
+    conn.commit()
+    conn.close()
+
+    res = air10_layer4_executor.execute_process(
+        trace_id="tr_g28_ok",
+        parent_span_id="span_parent",
+        target_bin=g28_worker,
+        input_file=inp_file,
+        audit_db=hermetic_audit_db,
+        require_court_sha=True,
+        permit=genuine_permit,
+    )
+    assert res["actual_returncode"] == 0
+    assert "G28_SUCCESS_OUTPUT" in res["stdout"]
+
+
+def test_gate29_snapshot_aba_and_inode_binding(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 29: Snapshot Inode/FD-Bound Execution & Elimination of Snapshot ABA Window.
+    Verifies that when a snapshot is created or exists, tampering with the snapshot cache
+    causes immediate refusal with exit code 79 (SNAPSHOT_CACHE_POISONED).
+    """
+    c11_bin = os.environ.get("AIR10_EXEC_BOUNDARY", "/tmp/air10_exec_boundary")
+    if not os.path.isfile(c11_bin):
+        c11_bin = "/Users/rajondas/.local/bin/air10_exec_boundary"
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", c11_bin)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    # Dedicated snapshot directory for hermetic isolation
+    snap_dir = str(tmp_path / "test_snaps")
+    os.makedirs(snap_dir, mode=0o700, exist_ok=True)
+    monkeypatch.setenv("AIR10_EXEC_SNAPSHOT_DIR", snap_dir)
+    monkeypatch.setenv("AIR10_SNAPSHOT_DIR", snap_dir)
+
+    g29_worker = str(tmp_path / "g29_worker.sh")
+    with open(g29_worker, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf 'GENUINE_G29_OUTPUT'\nexit 0\n")
+    os.chmod(g29_worker, 0o755)
+    g29_sha = hashlib.sha256(open(g29_worker, "rb").read()).hexdigest()
+
+    inp_file = str(tmp_path / "g29_inp.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"g29": true}')
+
+    # 1. First execution: creates snapshot and succeeds
+    proc1 = subprocess.run(
+        [c11_bin, "tr_g29_1", "span_root", g29_worker, inp_file],
+        capture_output=True, text=True,
+        env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=g29_sha, AIR10_REQUIRE_EXPECTED_SHA="1")
+    )
+    assert proc1.returncode == 0, f"Failed: {proc1.stderr}"
+    data1 = json.loads(proc1.stdout)
+    assert data1["executed_binary_sha256"] == g29_sha
+
+    # Verify snapshot was created
+    expected_snap_path = os.path.join(snap_dir, g29_sha)
+    assert os.path.isfile(expected_snap_path)
+
+    # 2. Tamper with existing snapshot file (poison the snapshot cache)
+    os.chmod(expected_snap_path, 0o700)
+    with open(expected_snap_path, "wb") as f:
+        f.write(b"#!/bin/sh\nprintf 'POISONED_SNAPSHOT'\nexit 0\n")
+    os.chmod(expected_snap_path, 0o500)
+
+    # 3. Subsequent execution detects tampered snapshot cache and refuses with exit code 79
+    proc2 = subprocess.run(
+        [c11_bin, "tr_g29_2", "span_root", g29_worker, inp_file],
+        capture_output=True, text=True,
+        env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=g29_sha, AIR10_REQUIRE_EXPECTED_SHA="1")
+    )
+    assert proc2.returncode == 79
+    assert "SNAPSHOT_CACHE_POISONED" in proc2.stderr
+
+
+def test_gate30_timeout_process_group_termination_and_orphan_check(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 30: Timeout Process-Group Tree Termination & Orphan Prevention.
+    Verifies that when a process exceeds timeout_sec, the executor sends SIGTERM/SIGKILL
+    to the entire process group (pgid), preventing orphaned grandchild background processes.
+    """
+    g30_bg_file = str(tmp_path / "g30_bg.pid")
+    g30_worker = str(tmp_path / "g30_worker.sh")
+    with open(g30_worker, "w", encoding="utf-8") as f:
+        f.write(f"""#!/bin/sh
+sleep 100 &
+echo $! > {g30_bg_file}
+sleep 100
+""")
+    os.chmod(g30_worker, 0o755)
+    g30_sha = hashlib.sha256(open(g30_worker, "rb").read()).hexdigest()
+
+    inp_file = str(tmp_path / "g30_inp.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"g30": true}')
+
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO tool_contract_verdicts_v2
+        (tool_name, capability, input_format, contract_version, status, binary_path,
+         binary_sha256, reason, quarantined_at, superseded_by, verified_at)
+        VALUES ('g30_tool', 'CLI_HOTPATH', 'JSON', 'v1.0.0', 'ALLOWED', ?, ?, 'APPROVED', NULL, NULL, datetime('now'))
+    """, (g30_worker, g30_sha))
+    conn.commit()
+    conn.close()
+
+    permit = CourtExecutionPermit.issue(
+        tool_name="g30_tool",
+        capability="CLI_HOTPATH",
+        input_format="JSON",
+        contract_version="v1.0.0",
+        binary_path=g30_worker,
+        approved_sha=g30_sha,
+        secret_key="air10_sovereign_court_master_secret_v9",
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        air10_layer4_executor.execute_process(
+            trace_id="tr_g30_timeout",
+            parent_span_id="span_parent",
+            target_bin=g30_worker,
+            input_file=inp_file,
+            audit_db=hermetic_audit_db,
+            permit=permit,
+            timeout_sec=0.5,
+        )
+
+    # Verify background child process was terminated with process group
+    time.sleep(0.2)
+    if os.path.isfile(g30_bg_file):
+        bg_pid = int(open(g30_bg_file).read().strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(bg_pid, 0)
+
+
+def test_gate31_pre_execution_failure_canonical_retry_dag(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 31: Pre-Execution Failure Logging Referential Integrity & Canonical Retry DAG.
+    Verifies that record_pre_execution_failure() records both a failed PROCESS_EXECUTION span
+    and a failed INDEPENDENT_VERIFICATION span linked directly to caller's parent span,
+    enabling multi-attempt causal DAG validation to pass without broken references.
+    """
+    shim_log = str(tmp_path / "g31_shim.log")
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_SHIM_LOG", shim_log)
+
+    t_id = f"tr_g31_{uuid.uuid4().hex[:8]}"
+
+    # Root intent
+    intent_span = air10_layer1_intent.record_intent(
+        trace_id=t_id,
+        intent="Gate 31 Pre-Exec Failure Recovery Test",
+        db_path=hermetic_audit_db
+    )
+
+    # Attempt 1: Pre-execution failure
+    r1_span = f"span_r1_{uuid.uuid4().hex[:6]}"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'ROUTER_EVALUATION', 'civex_router', datetime('now'), 'sha', 'SUCCESS', ?)
+    """, (t_id, r1_span, intent_span, json.dumps({"router": "r1", "candidates": []})))
+    conn.commit()
+    conn.close()
+
+    s1_span = f"span_s1_{uuid.uuid4().hex[:6]}"
+    with open(shim_log, "a") as f:
+        f.write(f"PID:999 TRACE:{t_id} SPAN:{s1_span} PARENT:{r1_span} SHIM:civex_shim BIN:/bin/echo\n")
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'SHIM_INTERCEPT', 'civex_shim', datetime('now'), 'sha', 'SUCCESS', ?)
+    """, (t_id, s1_span, r1_span, json.dumps({"target_bin": "/bin/echo", "parent_pid": 999})))
+    conn.commit()
+    conn.close()
+
+    # Pre-execution failure at Attempt 1
+    air10_layer5_verifier.record_pre_execution_failure(
+        trace_id=t_id,
+        parent_span_id=s1_span,
+        target_bin="/bin/echo",
+        input_file=str(tmp_path / "dummy.json"),
+        failure_reason="PRE_EXEC_GATE_PERMIT_HOLD",
+        audit_db=hermetic_audit_db,
+        attempt_no=1,
+    )
+
+    # Attempt 2: Successful execution
+    conn = sqlite3.connect(hermetic_audit_db)
+    last_v1 = conn.execute("SELECT span_id FROM trace_events WHERE trace_id=? AND stage='INDEPENDENT_VERIFICATION' ORDER BY event_id DESC LIMIT 1", (t_id,)).fetchone()[0]
+    r2_span = f"span_r2_{uuid.uuid4().hex[:6]}"
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'ROUTER_EVALUATION', 'civex_router', datetime('now'), 'sha', 'SUCCESS', ?)
+    """, (t_id, r2_span, last_v1, json.dumps({"router": "r2", "candidates": []})))
+    conn.commit()
+    conn.close()
+
+    s2_span = f"span_s2_{uuid.uuid4().hex[:6]}"
+    with open(shim_log, "a") as f:
+        f.write(f"PID:999 TRACE:{t_id} SPAN:{s2_span} PARENT:{r2_span} SHIM:civex_shim BIN:/bin/echo\n")
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'SHIM_INTERCEPT', 'civex_shim', datetime('now'), 'sha', 'SUCCESS', ?)
+    """, (t_id, s2_span, r2_span, json.dumps({"target_bin": "/bin/echo", "parent_pid": 999})))
+    conn.commit()
+    conn.close()
+
+    e2_span = f"span_e2_{uuid.uuid4().hex[:6]}"
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'PROCESS_EXECUTION', 'civex_exec', datetime('now'), 'sha', 'SUCCESS', ?)
+    """, (t_id, e2_span, s2_span, json.dumps({"actual_child_pid": 1001, "actual_returncode": 0})))
+    conn.commit()
+    conn.close()
+
+    # Recompute payload_sha256 properly for all events so recompute check passes
+    conn = sqlite3.connect(hermetic_audit_db)
+    events = conn.execute("SELECT event_id, details_json FROM trace_events WHERE trace_id=?", (t_id,)).fetchall()
+    for eid, det_str in events:
+        recomp = hashlib.sha256(json.dumps(json.loads(det_str), sort_keys=True).encode("utf-8")).hexdigest()
+        conn.execute("UPDATE trace_events SET payload_sha256=? WHERE event_id=?", (recomp, eid))
+    conn.commit()
+    conn.close()
+
+    # Final successful verification in layer 5
+    air10_layer5_verifier.record_verification(
+        trace_id=t_id,
+        parent_span_id=e2_span,
+        target_bin="/bin/echo",
+        input_file=str(tmp_path / "dummy.json"),
+        actual_returncode=0,
+        actual_child_pid=1001,
+        stdout_raw="OK",
+        stderr_raw="",
+        audit_db=hermetic_audit_db,
+        attempt_no=2,
+    )
+
+    # Validate the full retry DAG
+    dag_ok = air10_cross_trace_readback.validate_and_readback(
+        trace_id=t_id,
+        db_path=hermetic_audit_db,
+        shim_log=shim_log,
+    )
+    assert dag_ok is True
+
+
+def test_gate32_attempt_monotonicity_enforcement(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 32: Strict Attempt-Number Monotonicity Enforcement [1..N].
+    Validates that air10_cross_trace_readback enforces strictly monotonic attempts [1..N]
+    and fails closed with DAG_NON_MONOTONIC_ATTEMPTS if non-monotonic gaps or duplicates occur.
+    """
+    shim_log = str(tmp_path / "g32_shim.log")
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+    monkeypatch.setenv("AIR10_SHIM_LOG", shim_log)
+
+    t_id = f"tr_g32_{uuid.uuid4().hex[:8]}"
+
+    # Populate a valid 1-attempt trace
+    intent_sid = air10_layer1_intent.record_intent(trace_id=t_id, intent="Monotonicity test", db_path=hermetic_audit_db)
+    r_sid = air10_layer2_router.record_routing(trace_id=t_id, parent_span_id=intent_sid, chosen_tool="/bin/echo", candidates=[], db_path=hermetic_audit_db)
+    s_sid = air10_layer3_shim.record_shim_intercept(trace_id=t_id, parent_span_id=r_sid, target_bin="/bin/echo", parent_pid=os.getpid(), db_path=hermetic_audit_db, shim_log=shim_log)
+    
+    conn = sqlite3.connect(hermetic_audit_db)
+    e_sid = f"span_e_{uuid.uuid4().hex[:6]}"
+    det_e = {"actual_child_pid": os.getpid(), "actual_returncode": 0}
+    sha_e = hashlib.sha256(json.dumps(det_e, sort_keys=True).encode("utf-8")).hexdigest()
+    conn.execute("""
+        INSERT INTO trace_events (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+        VALUES (?, ?, ?, 'PROCESS_EXECUTION', 'civex_exec', datetime('now'), ?, 'SUCCESS', ?)
+    """, (t_id, e_sid, s_sid, sha_e, json.dumps(det_e)))
+    conn.commit()
+    conn.close()
+
+    air10_layer5_verifier.record_verification(
+        trace_id=t_id,
+        parent_span_id=e_sid,
+        target_bin="/bin/echo",
+        input_file=str(tmp_path / "dummy.json"),
+        actual_returncode=0,
+        actual_child_pid=os.getpid(),
+        stdout_raw="OK",
+        stderr_raw="",
+        audit_db=hermetic_audit_db,
+        attempt_no=1,
+    )
+
+    # 1. Monotonic [1] passes
+    assert air10_cross_trace_readback.validate_and_readback(trace_id=t_id, db_path=hermetic_audit_db, shim_log=shim_log) is True
+
+    # 2. Mutate attempt_no in tool_traces_v2 to 2 (so attempts are [2] instead of [1..N])
+    conn = sqlite3.connect(hermetic_audit_db)
+    conn.execute("DROP TRIGGER IF EXISTS abort_tool_traces_v2_update;")
+    conn.execute("UPDATE tool_traces_v2 SET attempt_no=2 WHERE trace_id=?", (t_id,))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as exc:
+        air10_cross_trace_readback.validate_and_readback(trace_id=t_id, db_path=hermetic_audit_db, shim_log=shim_log)
+    assert "DAG_NON_MONOTONIC_ATTEMPTS" in str(exc.value)
+
+
+def test_gate33_randomized_multi_worker_parallel_stress_loop(hermetic_audit_db, tmp_path, monkeypatch):
+    """Gate 33: True Multi-Worker Randomized Parallel Race Stress-Test.
+    Spawns 4 concurrent worker threads executing randomized runs against continuous
+    background mutation, asserting 100% genuine execution or safe refusal (76/79).
+    """
+    c11_bin = os.environ.get("AIR10_EXEC_BOUNDARY", "/tmp/air10_exec_boundary")
+    if not os.path.isfile(c11_bin):
+        c11_bin = "/Users/rajondas/.local/bin/air10_exec_boundary"
+    monkeypatch.setenv("AIR10_EXEC_BOUNDARY", c11_bin)
+    monkeypatch.setenv("AIR10_AUDIT_DB", hermetic_audit_db)
+
+    stress_worker = str(tmp_path / "g33_worker.sh")
+    orig_payload = b"#!/bin/sh\nprintf 'G33_ORIGINAL_BYTES'\nexit 0\n"
+    race_payload = b"#!/bin/sh\nprintf 'POISONED_G33_BYTES'\nexit 0\n"
+    with open(stress_worker, "wb") as f:
+        f.write(orig_payload)
+    os.chmod(stress_worker, 0o755)
+    orig_sha = hashlib.sha256(orig_payload).hexdigest()
+
+    inp_file = str(tmp_path / "g33_inp.json")
+    with open(inp_file, "w", encoding="utf-8") as f:
+        f.write('{"g33": true}')
+
+    stop_stress = threading.Event()
+
+    def background_mutator():
+        while not stop_stress.is_set():
+            try:
+                with open(stress_worker, "wb") as f:
+                    f.write(race_payload)
+                time.sleep(0.0002)
+                with open(stress_worker, "wb") as f:
+                    f.write(orig_payload)
+                time.sleep(0.0002)
+            except Exception:
+                pass
+
+    t_mut = threading.Thread(target=background_mutator)
+    t_mut.daemon = True
+    t_mut.start()
+
+    worker_results = []
+    worker_errors = []
+
+    def worker_job(worker_id):
+        try:
+            for it in range(6):
+                t_id = f"tr_g33_w{worker_id}_i{it}_{uuid.uuid4().hex[:6]}"
+                proc = subprocess.run(
+                    [c11_bin, t_id, f"span_w{worker_id}", stress_worker, inp_file],
+                    capture_output=True, text=True,
+                    env=dict(os.environ, AIR10_EXPECTED_BINARY_SHA=orig_sha, AIR10_REQUIRE_EXPECTED_SHA="1")
+                )
+                if proc.returncode == 0:
+                    data = json.loads(proc.stdout)
+                    assert data["executed_binary_sha256"] == orig_sha
+                    assert "POISONED" not in data.get("stdout_preview", "")
+                    worker_results.append((worker_id, it, "EXECUTED_GENUINE"))
+                else:
+                    assert proc.returncode in (76, 79)
+                    worker_results.append((worker_id, it, f"REFUSED_{proc.returncode}"))
+        except Exception as e:
+            worker_errors.append((worker_id, str(e)))
+
+    threads = []
+    for w in range(4):
+        t = threading.Thread(target=worker_job, args=(w,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=10.0)
+
+    stop_stress.set()
+    t_mut.join(timeout=1.0)
+
+    assert len(worker_errors) == 0, f"Worker errors: {worker_errors}"
+    assert len(worker_results) == 24
+
 
 
 

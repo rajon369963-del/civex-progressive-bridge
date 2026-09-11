@@ -25,8 +25,9 @@ SHIM_LOG = "/Users/rajondas/.antigravity/shim_intercept.log"
 EXPECTED_STAGES = ["INTENT", "ROUTER_EVALUATION", "SHIM_INTERCEPT", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"]
 
 def fatal_violation(msg):
-    print(f"❌ INVARIANT VIOLATION: {msg}", file=sys.stderr)
-    sys.exit(1)
+    full_msg = f"❌ INVARIANT VIOLATION: {msg}"
+    print(full_msg, file=sys.stderr)
+    raise SystemExit(full_msg)
 
 def validate_and_readback(trace_id, db_path=None, shim_log=None):
     active_db = db_path or DB_PATH
@@ -46,13 +47,23 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     """, (trace_id,))
     events = cur.fetchall()
 
-    cur.execute("""
-        SELECT trace_id, task_intent, chosen_tool, binary_path, actual_exit_code, 
-               duration_ms, semantic_equivalence, verification_status, failure_reason, created_at
-        FROM tool_traces_v2
-        WHERE trace_id = ?
-        ORDER BY attempt_no ASC
-    """, (trace_id,))
+    cols = [c[1] for c in cur.execute("PRAGMA table_info(tool_traces_v2)").fetchall()]
+    has_attempt_no = "attempt_no" in cols
+    if has_attempt_no:
+        cur.execute("""
+            SELECT trace_id, task_intent, chosen_tool, binary_path, actual_exit_code, 
+                   duration_ms, semantic_equivalence, verification_status, failure_reason, created_at, attempt_no
+            FROM tool_traces_v2
+            WHERE trace_id = ?
+            ORDER BY attempt_no ASC
+        """, (trace_id,))
+    else:
+        cur.execute("""
+            SELECT trace_id, task_intent, chosen_tool, binary_path, actual_exit_code, 
+                   duration_ms, semantic_equivalence, verification_status, failure_reason, created_at
+            FROM tool_traces_v2
+            WHERE trace_id = ?
+        """, (trace_id,))
     v2_rows = cur.fetchall()
     conn.close()
 
@@ -62,7 +73,15 @@ def validate_and_readback(trace_id, db_path=None, shim_log=None):
     # Invariant 8: Summary record MUST exist
     if not v2_rows:
         fatal_violation(f"No tool_traces_v2 summary row found for trace_id={trace_id}! Trace is unsealed/orphaned!")
-    v2_row = v2_rows[-1]
+    v2_row = v2_rows[-1][:10]
+
+    # Invariant 8B: Strict Attempt Monotonicity [1..N]
+    if has_attempt_no:
+        attempt_numbers = [r[10] for r in v2_rows if r[10] is not None]
+        expected_attempts = list(range(1, len(v2_rows) + 1))
+        if attempt_numbers != expected_attempts:
+            fatal_violation(f"DAG_NON_MONOTONIC_ATTEMPTS: Recorded attempts {attempt_numbers} != expected {expected_attempts}")
+        print(f"  [0] ATTEMPT_MONOTONICITY == True          : ✅ PASS (Attempts: {attempt_numbers})")
 
     print("=" * 95)
     print(f"🏛️ AIR10 STRICT FAIL-CLOSED CAUSAL DAG VALIDATION: {trace_id}")

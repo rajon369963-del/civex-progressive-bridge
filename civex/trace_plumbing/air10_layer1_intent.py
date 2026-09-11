@@ -48,6 +48,33 @@ def emit_intent(intent_name, description="", caller="antigravity_agent", db_path
     print(f"{trace_id}|{span_id}")
     return trace_id, span_id
 
+def record_intent(trace_id, intent, description="", caller="antigravity_agent", db_path=None):
+    span_id = f"span_intent_{uuid.uuid4().hex[:8]}"
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    active_db = db_path or os.environ.get("AIR10_AUDIT_DB", DB_PATH)
+    
+    details = {
+        "intent": intent,
+        "description": description,
+        "caller": caller,
+        "root_pid": os.getpid(),
+    }
+    payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
+    payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
+
+    if os.path.exists(active_db):
+        conn = sqlite3.connect(active_db)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trace_events 
+            (trace_id, span_id, parent_span_id, stage, producer, timestamp_iso, payload_sha256, status, details_json)
+            VALUES (?, ?, 'ROOT_SPAN', 'INTENT', ?, ?, ?, 'INITIATED', ?)
+        """, (trace_id, span_id, caller, now_iso, payload_sha256, json.dumps(details)))
+        conn.commit()
+        conn.close()
+
+    return span_id
+
 if __name__ == "__main__":
     intent = sys.argv[1] if len(sys.argv) > 1 else "CANONICAL_JSON_PARSE_RFC8259"
     desc = sys.argv[2] if len(sys.argv) > 2 else "Parse and validate JSON payload according to RFC 8259 strict contract"

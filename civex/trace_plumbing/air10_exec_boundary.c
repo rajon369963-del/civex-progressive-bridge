@@ -180,6 +180,9 @@ int main(int argc, char *argv[]) {
     /* Prepare content-addressed execution snapshot directory */
     const char *snap_dir = getenv("AIR10_EXEC_SNAPSHOT_DIR");
     if (!snap_dir || snap_dir[0] == '\0') {
+        snap_dir = getenv("AIR10_SNAPSHOT_DIR");
+    }
+    if (!snap_dir || snap_dir[0] == '\0') {
         snap_dir = "/tmp/air10_exec_snapshots";
     }
     mkdir(snap_dir, 0700);
@@ -242,6 +245,10 @@ int main(int argc, char *argv[]) {
     char snapshot_path[512];
     snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", snap_dir, executed_binary_sha256);
     
+    int verified_snap_fd = -1;
+    struct stat verified_snap_st;
+    memset(&verified_snap_st, 0, sizeof(verified_snap_st));
+
     int snap_fd = open(snapshot_path, O_WRONLY | O_CREAT | O_EXCL, 0500);
     if (snap_fd >= 0) {
         size_t written_total = 0;
@@ -271,6 +278,10 @@ int main(int argc, char *argv[]) {
         }
         close(snap_fd);
         chmod(snapshot_path, 0500);
+        verified_snap_fd = open(snapshot_path, O_RDONLY | O_NOFOLLOW);
+        if (verified_snap_fd >= 0) {
+            fstat(verified_snap_fd, &verified_snap_st);
+        }
     } else if (errno == EEXIST) {
         /* Pre-existing snapshot: verify ownership, permissions, and re-hash all bytes (Anti-Poisoning) */
         int exist_fd = open(snapshot_path, O_RDONLY | O_NOFOLLOW);
@@ -305,8 +316,8 @@ int main(int argc, char *argv[]) {
         while ((en = read(exist_fd, ebuf, sizeof(ebuf))) > 0) {
             sha256_update(&exist_ctx, ebuf, (size_t)en);
         }
-        close(exist_fd);
         if (en < 0) {
+            close(exist_fd);
             free(bin_bytes);
             return 79;
         }
@@ -314,10 +325,13 @@ int main(int argc, char *argv[]) {
         sha256_final(&exist_ctx, e_hash);
         hash_to_hex(e_hash, exist_sha);
         if (strcasecmp(exist_sha, executed_binary_sha256) != 0) {
+            close(exist_fd);
             fprintf(stderr, "ERROR: SNAPSHOT_CACHE_POISONED: existing snapshot SHA '%s' != expected SHA '%s'\n", exist_sha, executed_binary_sha256);
             free(bin_bytes);
             return 79;
         }
+        verified_snap_fd = exist_fd;
+        memcpy(&verified_snap_st, &st, sizeof(struct stat));
     } else {
         free(bin_bytes);
         fprintf(stderr, "ERROR: Failed to create or access snapshot path '%s': %s\n", snapshot_path, strerror(errno));
@@ -516,6 +530,48 @@ int main(int argc, char *argv[]) {
             child_args[0] = (char *)binary_path;
             execv(binary_path, child_args);
         } else {
+#ifdef __linux__
+            /* On Linux: execute verified file descriptor directly, eliminating pathname ABA window */
+            if (verified_snap_fd >= 0) {
+                fexecve(verified_snap_fd, child_args, environ);
+            }
+#endif
+            /* On Darwin / BSD / Fallback: verify child opened descriptor against supervisor verified inode */
+            int child_snap_fd = open(snapshot_path, O_RDONLY | O_NOFOLLOW);
+            if (child_snap_fd < 0) {
+                fprintf(stderr, "ERROR: Cannot open snapshot for execution: %s\n", strerror(errno));
+                _exit(79);
+            }
+            struct stat child_snap_st;
+            if (fstat(child_snap_fd, &child_snap_st) != 0) {
+                close(child_snap_fd);
+                _exit(79);
+            }
+            if (verified_snap_st.st_ino != 0 &&
+                (child_snap_st.st_ino != verified_snap_st.st_ino ||
+                 child_snap_st.st_dev != verified_snap_st.st_dev ||
+                 child_snap_st.st_size != verified_snap_st.st_size)) {
+                fprintf(stderr, "ERROR: SNAPSHOT_CACHE_POISONED: inode or size mismatch before execution\n");
+                close(child_snap_fd);
+                _exit(79);
+            }
+            char child_sha[65] = {0};
+            SHA256_CTX cctx;
+            sha256_init(&cctx);
+            uint8_t cbuf[8192];
+            ssize_t cn;
+            while ((cn = read(child_snap_fd, cbuf, sizeof(cbuf))) > 0) {
+                sha256_update(&cctx, cbuf, (size_t)cn);
+            }
+            close(child_snap_fd);
+            uint8_t chash[32];
+            sha256_final(&cctx, chash);
+            hash_to_hex(chash, child_sha);
+            if (strcasecmp(child_sha, executed_binary_sha256) != 0) {
+                fprintf(stderr, "ERROR: SNAPSHOT_CACHE_POISONED: snapshot path was mutated right before execution\n");
+                _exit(79);
+            }
+
             child_args[0] = (char *)snapshot_path;
             execv(snapshot_path, child_args);
         }
@@ -526,6 +582,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Parent Process: Supervisor */
+    if (verified_snap_fd >= 0) close(verified_snap_fd);
     close(pipe_out[1]);
 
     SHA256_CTX ctx;

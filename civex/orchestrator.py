@@ -103,8 +103,8 @@ def orchestrate_request(
                 from civex.bridge import CIVeXVerifier
                 verifier = CIVeXVerifier()
                 verifier.record_outcome(chosen_tool, success=False, error_msg=str(exec_err))
-            except Exception:
-                pass
+            except Exception as cb_err:
+                raise RuntimeError(f"CIRCUIT_BREAKER_PERSISTENCE_FAILED_HOLD: Failed to update circuit breaker for {chosen_tool}: {cb_err}") from cb_err
 
             # Mandatory Immutable Audit Ledger logging (Do NOT swallow persistence errors)
             air10_layer5_verifier.record_pre_execution_failure(
@@ -114,7 +114,8 @@ def orchestrate_request(
                 binary_path=chosen_bin,
                 failure_reason=str(exec_err),
                 audit_db_path=db_path,
-                input_file=input_file
+                input_file=input_file,
+                parent_span_id=span_shim_id
             )
 
             if active_candidates:
