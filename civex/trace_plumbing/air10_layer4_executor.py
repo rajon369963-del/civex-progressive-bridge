@@ -65,6 +65,22 @@ def execute_process(
         sys.stderr.write(f"{err_msg}\n")
         raise RuntimeError(err_msg)
 
+    # V2.2 Gate 28: physical execution cannot rely on repository-known fallback signing
+    # material or on a caller-only permit. The execution boundary requires both an
+    # externally supplied authority key and an independently readable Court DB.
+    # This is deliberately checked before permit recovery/issuance and before Popen.
+    if require_court_sha or permit is not None:
+        authority_key = os.environ.get("AIR10_COURT_SECRET_KEY")
+        if not authority_key:
+            raise RuntimeError(
+                "COURT_AUTHORITY_KEY_UNAVAILABLE_HOLD: AIR10_COURT_SECRET_KEY is missing; "
+                "repository fallback signing material cannot authorize physical execution"
+            )
+        if not active_db or not os.path.isfile(active_db):
+            raise RuntimeError(
+                f"COURT_AUTHORITY_DB_UNAVAILABLE_HOLD: readable Court authority DB required before physical execution: '{active_db}'"
+            )
+
     # 2. Compute input file size (if input_file provided)
     input_size = 0
     if input_file and os.path.isfile(input_file):
