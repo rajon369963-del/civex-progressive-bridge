@@ -370,6 +370,15 @@ class ProgressiveToolBridge:
         self.compressor = HeadroomCompressor()
         self.verifier = CIVeXVerifier()
 
+        # CHAKKA JODO: Authoritative CourtAwareRanker consuming CIVeX circuit breaker
+        try:
+            from .court_ranking import CourtAwareRanker
+            self.ranker = CourtAwareRanker(verifier=self.verifier)
+            self.ranker_init_error = None
+        except Exception as e:
+            self.ranker = None
+            self.ranker_init_error = str(e)
+
     @staticmethod
     def _build_fts5_query(query: str) -> str:
         """Build disjunctive FTS5 MATCH expression from user query."""
@@ -387,13 +396,27 @@ class ProgressiveToolBridge:
                 parts.append(f'"{s}"*')
         return ' OR '.join(parts) if parts else '""'
 
-    def find_tools(self, query: str, category: str | None = None, limit: int = 3) -> dict[str, Any]:
-        """Search catalog with FTS5 BM25 ranking and return shadow schemas."""
+    def find_tools(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = 3,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0",
+        rank_with_court: bool = True
+    ) -> dict[str, Any]:
+        """Search catalog with FTS5 BM25 ranking and apply authoritative CourtAwareRanker.
+        FAIL-CLOSED INVARIANT: Only court-verified tools with score > 0.0 enter routable tools.
+        """
         t0 = time.perf_counter()
         if not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
 
         fts_expr = self._build_fts5_query(query)
+
+        # Retrieve a broader candidate pool to allow court ranking to promote certified tools
+        retrieval_limit = min(100, max(limit * 3, 10))
 
         if category:
             sql = """
@@ -406,7 +429,7 @@ class ProgressiveToolBridge:
             ORDER BY fts.rank ASC
             LIMIT ?;
             """
-            rows = self.con.execute(sql, [fts_expr, category, limit]).fetchall()
+            rows = self.con.execute(sql, [fts_expr, category, retrieval_limit]).fetchall()
         else:
             sql = """
             SELECT t.tool_id, t.name, t.category, t.binary_path, t.exec_template,
@@ -417,16 +440,16 @@ class ProgressiveToolBridge:
             ORDER BY fts.rank ASC
             LIMIT ?;
             """
-            rows = self.con.execute(sql, [fts_expr, limit]).fetchall()
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+            rows = self.con.execute(sql, [fts_expr, retrieval_limit]).fetchall()
 
         shadow_schemas = []
+        raw_row_map = {}
         for r in rows:
+            raw_id = str(r[0])
+            raw_row_map[raw_id] = r
             try:
                 shadow_schemas.append(SchemaShrinker.shrink_tool(r))
             except ValueError:
-                raw_id = str(r[0])
                 bounded_id = (raw_id[:40] + "...[trunc]") if len(raw_id) > 50 else raw_id
                 diag = {
                     "id": bounded_id,
@@ -439,23 +462,102 @@ class ProgressiveToolBridge:
                     diag = {"id": bounded_id[:25], "err": "OVERSIZED"}
                 shadow_schemas.append(diag)
 
+        # FAIL-CLOSED CHECK: If ranker is unavailable, bridge MUST refuse routing
+        if self.ranker is None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "status": "VERIFICATION_UNAVAILABLE_HOLD",
+                "query": query,
+                "fts5_expr": fts_expr,
+                "category_filter": category,
+                "matched_count": 0,
+                "latency_ms": round(elapsed_ms, 3),
+                "tools": [],
+                "held_candidates": shadow_schemas,
+                "error": f"FAIL-CLOSED: CourtAwareRanker unavailable ({getattr(self, 'ranker_init_error', 'Uninitialized')}). Routing refused."
+            }
+
+        verified_tools = []
+        held_tools = []
+
+        # Apply Court-Aware Ranking & Fail-Closed Exclusion
+        if shadow_schemas:
+            eval_cap = capability or ("JSON_SINGLE_DOC_STRICT" if "json" in query.lower() else "DEFAULT_EXEC")
+            for schema in shadow_schemas:
+                t_id = schema.get("id")
+                r_match = raw_row_map.get(t_id)
+                bin_path = r_match[3] if r_match else None
+                t_name = schema.get("name", t_id)
+                score = self.ranker.score_tool(
+                    tool_id=t_id,
+                    tool_name=t_name,
+                    capability=eval_cap,
+                    input_format=input_format,
+                    contract_version=contract_version,
+                    binary_path=bin_path
+                )
+                schema["court_score"] = score.final_score
+                schema["court_status"] = score.status
+                schema["court_rationale"] = score.rationale
+                schema["court_verified"] = (score.status == "ELIGIBLE" and score.final_score > 0.0)
+
+                # FAIL-CLOSED HARD EXCLUSION:
+                # Candidate MUST NOT enter routable tools if score <= 0.0 or court_verified != True
+                if schema["court_verified"]:
+                    verified_tools.append(schema)
+                else:
+                    held_tools.append(schema)
+
+            # Sort verified candidates by court utility score
+            verified_tools.sort(key=lambda s: s.get("court_score", 0.0), reverse=True)
+
+        routable_tools = verified_tools[:limit]
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        status = "SUCCESS" if routable_tools else "NO_VERIFIED_TOOL_AVAILABLE"
         return {
-            "status": "SUCCESS",
+            "status": status,
             "query": query,
             "fts5_expr": fts_expr,
             "category_filter": category,
-            "matched_count": len(shadow_schemas),
+            "matched_count": len(routable_tools),
             "latency_ms": round(elapsed_ms, 3),
-            "tools": shadow_schemas
+            "tools": routable_tools,
+            "held_candidates": held_tools
         }
 
-    def resolve_intent(self, intent: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Convenience method returning the list of shadow schemas directly."""
-        res = self.find_tools(query=intent, limit=top_k)
+    def resolve_intent(
+        self,
+        intent: str,
+        top_k: int = 5,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0"
+    ) -> list[dict[str, Any]]:
+        """Convenience method returning ONLY court-verified, routable shadow schemas.
+        Unverified or quarantined candidates are strictly excluded.
+        """
+        res = self.find_tools(
+            query=intent,
+            limit=top_k,
+            capability=capability,
+            input_format=input_format,
+            contract_version=contract_version,
+            rank_with_court=True
+        )
         return res.get("tools", [])
 
-    def hydrate_tool(self, tool_id: str) -> dict[str, Any] | None:
-        """Hydrates full schema and execution parameters on demand when chosen."""
+    def hydrate_tool(
+        self,
+        tool_id: str,
+        capability: str | None = None,
+        input_format: str = "SINGLE_DOC_STRICT_RFC8259",
+        contract_version: str = "v1.0"
+    ) -> dict[str, Any] | None:
+        """Hydrates full schema and execution parameters on demand when chosen.
+        Strictly enforces Court verification fail-closed to prevent unverified known-tool-ID bypass.
+        Zero bypass parameters permitted.
+        """
         sql = (
             "SELECT tool_id, name, category, binary_path, exec_template, "
             "description, auto_trigger_intents, tags FROM tools_v2 WHERE tool_id = ? LIMIT 1;"
@@ -464,7 +566,7 @@ class ProgressiveToolBridge:
         if not rows:
             return None
         r = rows[0]
-        return {
+        tool_dict = {
             "tool_id": r[0],
             "name": r[1],
             "category": r[2],
@@ -474,6 +576,75 @@ class ProgressiveToolBridge:
             "intents": r[6],
             "tags": r[7]
         }
+
+        # STRICT FAIL-CLOSED COURT ENFORCEMENT ON DIRECT HYDRATION
+        if self.ranker is None:
+            return {
+                "tool_id": tool_dict["tool_id"],
+                "name": tool_dict["name"],
+                "court_status": "VERIFICATION_UNAVAILABLE_HOLD",
+                "court_score": 0.0,
+                "court_verdict": "REFUSED_FAIL_CLOSED",
+                "court_rationale": "COURT_REFUSAL: CourtAwareRanker unavailable. Direct hydration refused.",
+                "binary_path": None,
+                "exec_template": None
+            }
+
+        eval_cap = capability or ("JSON_SINGLE_DOC_STRICT" if "json" in tool_dict["name"].lower() else "DEFAULT_EXEC")
+        score = self.ranker.score_tool(
+            tool_id=tool_dict["tool_id"],
+            tool_name=tool_dict["name"],
+            capability=eval_cap,
+            input_format=input_format,
+            contract_version=contract_version,
+            binary_path=tool_dict["binary_path"]
+        )
+        if score.status != "ELIGIBLE" or score.final_score <= 0.0:
+            return {
+                "tool_id": tool_dict["tool_id"],
+                "name": tool_dict["name"],
+                "court_status": score.status,
+                "court_score": score.final_score,
+                "court_verdict": "REFUSED_FAIL_CLOSED",
+                "court_rationale": f"COURT_REFUSAL: Tool hydration blocked by Tool Court ({score.status}: {score.rationale})",
+                "binary_path": None,
+                "exec_template": None
+            }
+        tool_dict["court_status"] = score.status
+        tool_dict["court_score"] = score.final_score
+        tool_dict["court_verified"] = True
+
+        return tool_dict
+
+    def inspect_tool_metadata(self, tool_id: str) -> dict[str, Any] | None:
+        """Returns non-executable metadata only for inspection/catalog browsing.
+        Strictly omits execution parameters (binary_path, exec_template) to prevent
+        unverified execution bypass.
+        """
+        sql = (
+            "SELECT tool_id, name, category, description, auto_trigger_intents, tags "
+            "FROM tools_v2 WHERE tool_id = ? LIMIT 1;"
+        )
+        rows = self.con.execute(sql, [tool_id]).fetchall()
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "tool_id": r[0],
+            "name": r[1],
+            "category": r[2],
+            "description": r[3],
+            "intents": r[4],
+            "tags": r[5]
+        }
+
+
+def inspect_tool_metadata(tool_id: str, catalog_path: Path | str | None = None) -> dict[str, Any] | None:
+    """Convenience module function: returns non-executable metadata only for inspection.
+    Strictly omits execution parameters (binary_path, exec_template).
+    """
+    bridge = ProgressiveToolBridge(db_path=catalog_path)
+    return bridge.inspect_tool_metadata(tool_id)
 
 
 # ---------------------------------------------------------------------------
