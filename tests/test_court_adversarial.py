@@ -1885,6 +1885,7 @@ def test_gate25_autonomous_one_call_orchestration_self_healing(hermetic_audit_db
         candidate_pool=candidate_pool,
         db_path=hermetic_audit_db,
         max_attempts=2,
+        effect_class="read_only",  # These hermetic workers only exit or echo input.
         output_dir=str(tmp_path)
     )
 
@@ -2039,6 +2040,7 @@ def test_gate26_exact_court_permit_and_retry_aware_dag_reconstruction(hermetic_a
         candidate_pool=cand_pool,
         db_path=hermetic_audit_db,
         max_attempts=2,
+        effect_class="read_only",  # These hermetic workers only exit or echo input.
         output_dir=str(tmp_path)
     )
     assert res["status"] == "SUCCESS"

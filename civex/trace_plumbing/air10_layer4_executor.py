@@ -19,14 +19,34 @@ import uuid
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
 
-class ExecutionTimeoutError(subprocess.TimeoutExpired, RuntimeError):
-    """Raised when supervised tool execution exceeds configured deadline."""
-    def __init__(self, msg, timeout=0):
-        super().__init__(cmd="", timeout=timeout)
-        self.msg = msg
+
+class PostExecutionOutcomeUnknown(RuntimeError):
+    """Raised when the child may have executed but trustworthy effect evidence is unavailable.
+
+    Callers must not automatically fail over write-bearing or unknown effects after this
+    boundary. Reconciliation or an idempotency authority is required before replay.
+    """
+
+    execution_started = True
+    child_exit_observed = False
+    evidence_valid = False
+    disposition = "POST_EXECUTION_OUTCOME_UNKNOWN"
+
+    def __init__(self, message, *, child_exit_observed=False):
+        super().__init__(message)
+        self.child_exit_observed = child_exit_observed
+
+
+class ExecutionTimeoutError(PostExecutionOutcomeUnknown, subprocess.TimeoutExpired):
+    """Execution started but exceeded the deadline; external outcome is ambiguous."""
+
+    def __init__(self, message):
+        PostExecutionOutcomeUnknown.__init__(self, message)
+        self.cmd = ""
+        self.timeout = 0
 
     def __str__(self):
-        return self.msg
+        return self.args[0]
 
 
 def execute_process(
@@ -214,17 +234,15 @@ def execute_process(
         sys.stderr.write(f"{err_msg}\n")
         raise ExecutionTimeoutError(err_msg) from te
 
-    proc_returncode = proc.returncode
-
-    if 70 <= proc_returncode <= 79:
-        raise RuntimeError(
-            f"EXECUTION_SUPERVISOR_FAIL_CLOSED: C11 supervisor exited with code {proc_returncode} (exit {proc_returncode}). "
-            f"Stderr: {proc_stderr.strip()}"
+    if 70 <= proc.returncode <= 79:
+        raise PostExecutionOutcomeUnknown(
+            f"EXECUTION_SUPERVISOR_FAIL_CLOSED: C11 supervisor exited with code {proc.returncode} (exit {proc.returncode}). Stderr: {proc_stderr.strip()}",
+            child_exit_observed=True,
         )
     if not proc_stdout.strip():
-        raise RuntimeError(
-            f"EXECUTION_SUPERVISOR_FAIL_CLOSED: C11 supervisor emitted no stdout (exit {proc_returncode}). "
-            f"Stderr: {proc_stderr.strip()}"
+        raise PostExecutionOutcomeUnknown(
+            f"EXECUTION_SUPERVISOR_FAIL_CLOSED: C11 supervisor emitted no stdout (exit {proc.returncode}). Stderr: {proc_stderr.strip()}",
+            child_exit_observed=True,
         )
 
     sha_hex_re = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -238,22 +256,41 @@ def execute_process(
         executed_binary_sha256 = boundary_data.get("executed_binary_sha256")
         executed_input_sha256 = boundary_data.get("executed_input_sha256")
 
-        # STRICT ZERO BACKFILL: Supervisor must attest directly and authentically
         if supervisor_name != "air10_exec_boundary_c11":
-            raise RuntimeError(f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Unverified supervisor identity: '{supervisor_name}'")
+            raise PostExecutionOutcomeUnknown(
+                f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Unverified supervisor identity: '{supervisor_name}'",
+                child_exit_observed=True,
+            )
 
         if not executed_binary_sha256 or not sha_hex_re.match(executed_binary_sha256) or executed_binary_sha256 == "0" * 64:
-            raise RuntimeError(f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid executed_binary_sha256 from C11 supervisor: '{executed_binary_sha256}'")
+            raise PostExecutionOutcomeUnknown(
+                f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid executed_binary_sha256 from C11 supervisor: '{executed_binary_sha256}'",
+                child_exit_observed=True,
+            )
 
         if input_file and (not executed_input_sha256 or not sha_hex_re.match(executed_input_sha256) or executed_input_sha256 == "0" * 64):
-            raise RuntimeError(f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid executed_input_sha256 from C11 supervisor: '{executed_input_sha256}'")
+            raise PostExecutionOutcomeUnknown(
+                f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid executed_input_sha256 from C11 supervisor: '{executed_input_sha256}'",
+                child_exit_observed=True,
+            )
 
         if not stdout_sha256 or not sha_hex_re.match(stdout_sha256) or stdout_sha256 == "0" * 64:
-            raise RuntimeError(f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid stdout_sha256 from C11 supervisor: '{stdout_sha256}'")
+            raise PostExecutionOutcomeUnknown(
+                f"SUPERVISOR_ATTESTATION_INVALID_HOLD: Missing or invalid stdout_sha256 from C11 supervisor: '{stdout_sha256}'",
+                child_exit_observed=True,
+            )
 
     except json.JSONDecodeError as e:
         sys.stderr.write(f"C11_BOUNDARY_PARSE_ERROR: Failed to parse boundary json from stdout: {e}. Output: {proc_stdout[:200]}\n")
-        raise RuntimeError(f"FAIL-CLOSED: C11 supervisor boundary output parse error: {e}") from e
+        raise PostExecutionOutcomeUnknown(
+            f"FAIL-CLOSED: C11 supervisor boundary output parse error: {e}",
+            child_exit_observed=True,
+        ) from e
+    except KeyError as e:
+        raise PostExecutionOutcomeUnknown(
+            f"FAIL-CLOSED: C11 supervisor boundary missing required field: {e}",
+            child_exit_observed=True,
+        ) from e
 
     stdout_preview = proc_stdout[:200]
     stderr_preview = proc_stderr[:200]
@@ -262,12 +299,18 @@ def execute_process(
     captured_str = ""
     if output_file:
         if not os.path.isfile(output_file):
-            raise RuntimeError(f"FAIL-CLOSED: Supervisor completed but output capture file '{output_file}' missing on disk")
+            raise PostExecutionOutcomeUnknown(
+                f"FAIL-CLOSED: Supervisor completed but output capture file '{output_file}' missing on disk",
+                child_exit_observed=True,
+            )
         with open(output_file, "rb") as of:
             captured_bytes = of.read()
         captured_sha = hashlib.sha256(captured_bytes).hexdigest()
         if captured_sha != stdout_sha256:
-            raise RuntimeError(f"FAIL-CLOSED: Capture file SHA {captured_sha} != supervisor streaming SHA {stdout_sha256}")
+            raise PostExecutionOutcomeUnknown(
+                f"FAIL-CLOSED: Capture file SHA {captured_sha} != supervisor streaming SHA {stdout_sha256}",
+                child_exit_observed=True,
+            )
         captured_str = captured_bytes.decode("utf-8", errors="replace")
 
     details = {
