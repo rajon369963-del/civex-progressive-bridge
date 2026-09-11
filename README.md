@@ -102,7 +102,7 @@ The test suite runs seamlessly in both local environments (verifying all 5,283 p
 python tests/test_bridge.py
 ```
 
-GitHub Actions executes the full matrix across Ubuntu and macOS on Python 3.10, 3.11, and 3.12 on every push.
+GitHub Actions executes the full Ubuntu/macOS × Python 3.10/3.11/3.12 matrix on pushes to `main` and on pull requests targeting `main`.
 
 ---
 
