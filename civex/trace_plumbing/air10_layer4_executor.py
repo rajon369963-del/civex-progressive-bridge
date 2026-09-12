@@ -55,6 +55,7 @@ def execute_process(
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     effective_parent = parent_span_id or os.environ.get("AIR10_PARENT_SPAN_ID")
     active_db = db_path or audit_db or DB_PATH
+    authority_key = None
 
     if not output_file:
         output_file = f"/tmp/air10_stdout_{trace_id}_{span_id}.out"
@@ -128,6 +129,7 @@ def execute_process(
                         contract_version=crow[3],
                         binary_path=binary_path,
                         approved_sha=crow[4],
+                        secret_key=authority_key,
                     )
             conn.close()
         except Exception:
@@ -146,7 +148,7 @@ def execute_process(
         except Exception:
             from court_ranking import verify_permit
 
-        valid, reason = verify_permit(permit, db_path=active_db)
+        valid, reason = verify_permit(permit, db_path=active_db, secret_key=authority_key)
         if not valid:
             raise RuntimeError(f"PERMIT_AUTHENTICITY_VERIFICATION_FAILED_HOLD: {reason}")
 
@@ -164,7 +166,7 @@ def execute_process(
             from civex.court_ranking import verify_permit
         except Exception:
             from court_ranking import verify_permit
-        valid, reason = verify_permit(permit, db_path=active_db)
+        valid, reason = verify_permit(permit, db_path=active_db, secret_key=authority_key)
         if not valid:
             raise RuntimeError(f"PERMIT_AUTHENTICITY_VERIFICATION_FAILED_HOLD: {reason}")
         permit_sha = getattr(permit, "approved_sha", None)
