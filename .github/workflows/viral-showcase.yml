@@ -15,15 +15,15 @@ jobs:
     env:
       AIR10_EXEC_BOUNDARY: /tmp/air10_exec_boundary
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.11"
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: "20"
       - name: Install dependencies
@@ -58,7 +58,7 @@ jobs:
 
       - name: Upload Live Benchmark Artifact (Preserve Evidence Even on Failure)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: live-civex-benchmark-results
           path: |
@@ -66,7 +66,7 @@ jobs:
             scripts/benchmark_status.json
             scripts/benchmark_stdout.log
             scripts/benchmark_stderr.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
 
       - name: Run Permanent Adversarial Canary Regression Suite
@@ -91,9 +91,9 @@ jobs:
 
       - name: Upload Forensic Verification Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: civex-forensic-verification-report
           path: /tmp/civex_forensic_verification_report.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
