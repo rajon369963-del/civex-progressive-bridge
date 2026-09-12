@@ -252,3 +252,66 @@ def test_bridge_resolve_intent_with_court_integration():
         assert "court_score" in tools[0]
         assert "court_status" in tools[0]
         assert "court_rationale" in tools[0]
+
+
+def test_primary_sovereign_tools_promotion_and_substitution(hermetic_court_env):
+    from civex.court_ranking import PRIMARY_SOVEREIGN_TOOLS, PRIMARY_TOOL_SUBSTITUTIONS
+    # 1. Verify coverage of 100+ sovereign tools
+    assert len(PRIMARY_SOVEREIGN_TOOLS) >= 100
+    assert "rg" in PRIMARY_SOVEREIGN_TOOLS
+    assert "bat" in PRIMARY_SOVEREIGN_TOOLS
+    assert "fd" in PRIMARY_SOVEREIGN_TOOLS
+    assert "sd" in PRIMARY_SOVEREIGN_TOOLS
+    assert "jaq" in PRIMARY_SOVEREIGN_TOOLS
+    assert "delta" in PRIMARY_SOVEREIGN_TOOLS
+    assert "eza" in PRIMARY_SOVEREIGN_TOOLS
+    assert "b3sum" in PRIMARY_SOVEREIGN_TOOLS
+    assert "pigz" in PRIMARY_SOVEREIGN_TOOLS
+    assert "zstd" in PRIMARY_SOVEREIGN_TOOLS
+    assert "macmon" in PRIMARY_SOVEREIGN_TOOLS
+    assert "air10-auto-trigger" in PRIMARY_SOVEREIGN_TOOLS
+    assert "air10-fast-json" in PRIMARY_SOVEREIGN_TOOLS
+
+    # 2. Verify substitutions mapping for legacy POSIX tools
+    assert PRIMARY_TOOL_SUBSTITUTIONS["cat"] == "bat"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["grep"] == "rg"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["find"] == "fd"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["sed"] == "sd"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["awk"] == "jaq"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["diff"] == "delta"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["ls"] == "eza"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["shasum"] == "b3sum"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["gzip"] == "pigz"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["tar"] == "zstd"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["top"] == "macmon"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["ps"] == "macmon"
+    assert PRIMARY_TOOL_SUBSTITUTIONS["curl"] == "air10-unblockable-scraper"
+
+    # 3. Verify rank_candidates prioritizes sovereign primary tools
+    conn = sqlite3.connect(hermetic_court_env["db_path"])
+    cur = conn.cursor()
+    bin_sha = hashlib.sha256(open(hermetic_court_env["bin_ok"], "rb").read()).hexdigest()
+    cur.execute("""
+        INSERT INTO tool_contract_verdicts_v2 VALUES
+        ('rg', 'JSON_STRICT', 'RFC8259', 'v1.0', 'ALLOWED', ?, ?, 'Ripgrep verified', NULL, NULL, '2026-09-10T00:00:00Z', 'EVIDENCE_RG');
+    """, (hermetic_court_env["bin_ok"], bin_sha))
+    cur.execute("""
+        INSERT INTO tool_traces_v2 VALUES
+        ('tr_rg', 'INTENT_TEST', 'BATCH', '[]', 'rg', ?, ?, '/tmp/in', 'in_sha', 'out_sha', 0, 12.0, 'EQUIVALENT', 'VERIFIED_PASS', NULL, '2026-09-10T00:00:00Z');
+    """, (hermetic_court_env["bin_ok"], bin_sha))
+    cur.execute("""
+        INSERT INTO trace_events VALUES
+        (NULL, 'tr_rg', 'span_rg', 'span_root', 'PROCESS_EXECUTION', 'air10_exec_boundary_c11', '2026-09-10T00:00:00Z', 'sha_p', 'COMPLETED', '{"tool_name": "rg", "tool_id": "rg", "supervisor": "air10_exec_boundary_c11"}');
+    """)
+    conn.commit()
+    conn.close()
+
+    ranker = CourtAwareRanker(audit_db_path=hermetic_court_env["db_path"], verifier=hermetic_court_env["verifier"])
+    cands = [
+        {"name": "tool_ok", "binary_path": hermetic_court_env["bin_ok"], "latency_ms": 10.0},
+        {"name": "rg", "binary_path": hermetic_court_env["bin_ok"], "latency_ms": 12.0}
+    ]
+    ranked = ranker.rank_candidates(cands, capability="JSON_STRICT", input_format="RFC8259", contract_version="v1.0")
+    # rg is in PRIMARY_SOVEREIGN_TOOLS, so it is sorted first among eligible tools
+    assert ranked[0].tool_name == "rg"
+    assert ranked[0].is_primary_sovereign is True

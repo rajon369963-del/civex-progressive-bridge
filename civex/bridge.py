@@ -410,10 +410,28 @@ class ProgressiveToolBridge:
         FAIL-CLOSED INVARIANT: Only court-verified tools with score > 0.0 enter routable tools.
         """
         t0 = time.perf_counter()
-        if not isinstance(limit, int) or not 1 <= limit <= 100:
-            raise ValueError("limit must be between 1 and 100")
+        # Check if query matches any legacy tool to substitute primary sovereign tool
+        try:
+            from .court_ranking import (
+                PRIMARY_SOVEREIGN_TOOLS,
+                PRIMARY_TOOL_SUBSTITUTIONS,
+            )
+        except ImportError:
+            from court_ranking import (
+                PRIMARY_TOOL_SUBSTITUTIONS,
+            )
 
-        fts_expr = self._build_fts5_query(query)
+        active_substitutions = {}
+        for tok in query.lower().split():
+            clean_tok = tok.strip(" ,.-_\"'")
+            if clean_tok in PRIMARY_TOOL_SUBSTITUTIONS:
+                active_substitutions[clean_tok] = PRIMARY_TOOL_SUBSTITUTIONS[clean_tok]
+
+        search_query = query
+        if active_substitutions:
+            search_query = f"{query} " + " ".join(active_substitutions.values())
+
+        fts_expr = self._build_fts5_query(search_query)
 
         # Retrieve a broader candidate pool to allow court ranking to promote certified tools
         retrieval_limit = min(100, max(limit * 3, 10))
@@ -500,6 +518,7 @@ class ProgressiveToolBridge:
                 schema["court_status"] = score.status
                 schema["court_rationale"] = score.rationale
                 schema["court_verified"] = (score.status == "ELIGIBLE" and score.final_score > 0.0)
+                schema["is_primary_sovereign"] = getattr(score, "is_primary_sovereign", False) or (t_name in PRIMARY_SOVEREIGN_TOOLS or t_id in PRIMARY_SOVEREIGN_TOOLS)
 
                 # FAIL-CLOSED HARD EXCLUSION:
                 # Candidate MUST NOT enter routable tools if score <= 0.0 or court_verified != True
@@ -508,8 +527,8 @@ class ProgressiveToolBridge:
                 else:
                     held_tools.append(schema)
 
-            # Sort verified candidates by court utility score
-            verified_tools.sort(key=lambda s: s.get("court_score", 0.0), reverse=True)
+            # Sort verified candidates with primary sovereign wheels first, then by court utility score
+            verified_tools.sort(key=lambda s: (s.get("is_primary_sovereign", False), s.get("court_score", 0.0)), reverse=True)
 
         routable_tools = verified_tools[:limit]
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -523,7 +542,8 @@ class ProgressiveToolBridge:
             "matched_count": len(routable_tools),
             "latency_ms": round(elapsed_ms, 3),
             "tools": routable_tools,
-            "held_candidates": held_tools
+            "held_candidates": held_tools,
+            "primary_substitutions": active_substitutions
         }
 
     def resolve_intent(
@@ -716,3 +736,258 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ============================================================================
+
+# TASK_015_CIVEX_INVARIANT_CONTRACTS: PROGRESSIVE RPC GATING & INVARIANTS
+# ============================================================================
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+
+
+class CivexErrorCode(str, Enum):
+    MALFORMED_RPC_PAYLOAD = 'MALFORMED_RPC_PAYLOAD'
+    CIVEX_DISCLOSURE_REJECTED = 'CIVEX_DISCLOSURE_REJECTED'
+    SCHEMA_MISMATCH = 'SCHEMA_MISMATCH'
+    INTERNAL_GUARD_VIOLATION = 'INTERNAL_GUARD_VIOLATION'
+
+
+class CivexBridgeException(Exception):
+    def __init__(self, error_code: CivexErrorCode, message: str, details: dict[str, Any] | None = None):
+        super().__init__(f'[{error_code.value}] {message}')
+        self.error_code = error_code
+        self.message = message
+        self.details = details or {}
+
+
+def sanitize_error_text(text: str) -> str:
+    text = re.sub(r"(bearer\s+)[A-Za-z0-9_\-\.]{8,}", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"((?:key|token|secret|password)['\":\s=]+)[A-Za-z0-9_\-\.]{8,}", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r'File "[^"]+", line \d+, in [^\n]+', "[FRAME_REDACTED]", text)
+    return text
+
+
+def build_error_envelope(
+    error_code: CivexErrorCode,
+    message: str,
+    rpc_id: str | int | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clean_msg = sanitize_error_text(message)
+    clean_details = {}
+    if details:
+        for k, v in details.items():
+            if isinstance(v, str):
+                clean_details[k] = sanitize_error_text(v)
+            else:
+                clean_details[k] = v
+
+    rpc_numeric_code = -32600
+    if error_code == CivexErrorCode.MALFORMED_RPC_PAYLOAD:
+        rpc_numeric_code = -32700
+    elif error_code == CivexErrorCode.CIVEX_DISCLOSURE_REJECTED:
+        rpc_numeric_code = -32001
+    elif error_code == CivexErrorCode.SCHEMA_MISMATCH:
+        rpc_numeric_code = -32602
+
+    return {
+        'jsonrpc': '2.0',
+        'id': rpc_id,
+        'error': {
+            'code': rpc_numeric_code,
+            'civex_error_code': error_code.value,
+            'message': clean_msg,
+            'data': {
+                'timestamp_ns': time.perf_counter_ns(),
+                'details': clean_details,
+            },
+        },
+    }
+
+
+@dataclass(slots=True)
+class ParameterContract:
+    name: str
+    expected_type: type
+    required: bool = True
+    min_val: int | float | None = None
+    max_val: int | float | None = None
+
+
+@dataclass(slots=True)
+class ToolContract:
+    tool_id: str
+    name: str
+    description: str
+    parameters: dict[str, ParameterContract]
+    handler: Callable[[dict[str, Any]], Any] | None = None
+    required_permission: str = 'civil:standard'
+
+
+class CivexProgressiveBridge:
+    def __init__(self):
+        self._tools: dict[str, ToolContract] = {}
+        self._client_permissions: dict[str, set[str]] = {}
+        self._total_requests_evaluated: int = 0
+
+    def register_tool(self, tool: ToolContract) -> None:
+        self._tools[tool.tool_id] = tool
+
+    def authorize_client(self, client_id: str, permissions: set[str]) -> None:
+        self._client_permissions[client_id] = set(permissions)
+
+    def get_disclosed_tool_schemas(self, client_id: str) -> list[dict[str, Any]]:
+        client_perms = self._client_permissions.get(client_id, set())
+        disclosed = []
+        for tool in self._tools.values():
+            if tool.required_permission in client_perms:
+                schema = {
+                    'tool_id': tool.tool_id,
+                    'name': tool.name,
+                    'description': tool.description,
+                    'parameters': {
+                        p_name: {
+                            'type': p_contract.expected_type.__name__,
+                            'required': p_contract.required,
+                        }
+                        for p_name, p_contract in tool.parameters.items()
+                    },
+                }
+                disclosed.append(schema)
+        return disclosed
+
+    def evaluate_rpc_request(
+        self,
+        client_id: str,
+        payload_input: str | bytes | dict[str, Any],
+    ) -> dict[str, Any]:
+        self._total_requests_evaluated += 1
+
+        rpc_id: str | int | None = None
+        if isinstance(payload_input, (str, bytes)):
+            try:
+                payload = json.loads(payload_input)
+            except Exception as e:
+                return build_error_envelope(
+                    CivexErrorCode.MALFORMED_RPC_PAYLOAD,
+                    f'JSON parse failure: {e}',
+                    rpc_id=None,
+                )
+        elif isinstance(payload_input, dict):
+            payload = payload_input
+        else:
+            return build_error_envelope(
+                CivexErrorCode.MALFORMED_RPC_PAYLOAD,
+                f'Invalid payload type: {type(payload_input).__name__}',
+                rpc_id=None,
+            )
+
+        if not isinstance(payload, dict):
+            return build_error_envelope(
+                CivexErrorCode.MALFORMED_RPC_PAYLOAD,
+                'Payload must be a JSON object',
+                rpc_id=None,
+            )
+
+        if payload.get('jsonrpc') != '2.0':
+            return build_error_envelope(
+                CivexErrorCode.MALFORMED_RPC_PAYLOAD,
+                "Missing or invalid jsonrpc protocol header (must be '2.0')",
+                rpc_id=payload.get('id'),
+            )
+
+        method = payload.get('method')
+        if not method or not isinstance(method, str):
+            return build_error_envelope(
+                CivexErrorCode.MALFORMED_RPC_PAYLOAD,
+                "Field 'method' must be a non-empty string",
+                rpc_id=payload.get('id'),
+            )
+
+        rpc_id = payload.get('id')
+
+        tool = self._tools.get(method)
+        if not tool:
+            return build_error_envelope(
+                CivexErrorCode.CIVEX_DISCLOSURE_REJECTED,
+                f"Tool '{method}' is not disclosed or does not exist",
+                rpc_id=rpc_id,
+            )
+
+        client_perms = self._client_permissions.get(client_id, set())
+        if tool.required_permission not in client_perms:
+            return build_error_envelope(
+                CivexErrorCode.CIVEX_DISCLOSURE_REJECTED,
+                f"Client '{client_id}' lacks permission '{tool.required_permission}' for tool '{method}'",
+                rpc_id=rpc_id,
+            )
+
+        params = payload.get('params')
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return build_error_envelope(
+                CivexErrorCode.SCHEMA_MISMATCH,
+                "Field 'params' must be an object/dictionary",
+                rpc_id=rpc_id,
+            )
+
+        for p_name, p_contract in tool.parameters.items():
+            if p_contract.required and p_name not in params:
+                return build_error_envelope(
+                    CivexErrorCode.SCHEMA_MISMATCH,
+                    f"Missing required parameter '{p_name}' for tool '{method}'",
+                    rpc_id=rpc_id,
+                    details={'missing_param': p_name},
+                )
+
+            if p_name in params:
+                val = params[p_name]
+                if p_contract.expected_type in (int, float):
+                    if not isinstance(val, (int, float)) or isinstance(val, bool):
+                        val_str = str(val)[:50]
+                        return build_error_envelope(
+                            CivexErrorCode.SCHEMA_MISMATCH,
+                            f"Parameter '{p_name}' expects numeric type {p_contract.expected_type.__name__}, got {type(val).__name__} with value: {val_str}",
+                            rpc_id=rpc_id,
+                            details={'rejected_param': p_name, 'raw_sample': val_str},
+                        )
+                elif not isinstance(val, p_contract.expected_type):
+                    val_str = str(val)[:50]
+                    return build_error_envelope(
+                        CivexErrorCode.SCHEMA_MISMATCH,
+                        f"Parameter '{p_name}' expects type {p_contract.expected_type.__name__}, got {type(val).__name__} with value: {val_str}",
+                        rpc_id=rpc_id,
+                        details={'rejected_param': p_name, 'raw_sample': val_str},
+                    )
+
+                if p_contract.min_val is not None and val < p_contract.min_val:
+                    return build_error_envelope(
+                        CivexErrorCode.SCHEMA_MISMATCH,
+                        f"Parameter '{p_name}' value {val} is below minimum {p_contract.min_val}",
+                        rpc_id=rpc_id,
+                    )
+                if p_contract.max_val is not None and val > p_contract.max_val:
+                    return build_error_envelope(
+                        CivexErrorCode.SCHEMA_MISMATCH,
+                        f"Parameter '{p_name}' value {val} is above maximum {p_contract.max_val}",
+                        rpc_id=rpc_id,
+                    )
+
+        try:
+            result_data = tool.handler(params) if tool.handler else {'status': 'ACKNOWLEDGED'}
+            return {
+                'jsonrpc': '2.0',
+                'id': rpc_id,
+                'result': result_data,
+            }
+        except Exception as ex:
+            return build_error_envelope(
+                CivexErrorCode.INTERNAL_GUARD_VIOLATION,
+                f'Execution failed: {ex!s}',
+                rpc_id=rpc_id,
+            )

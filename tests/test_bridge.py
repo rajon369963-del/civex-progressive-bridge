@@ -338,9 +338,10 @@ def test_bundled_catalog_fallback():
 def test_hydrate_tool_court_enforcement(tmp_path):
     print("\n--- [TEST 8] HYDRATE_TOOL COURT ENFORCEMENT & FAIL-CLOSED GATING ---")
     import sqlite3
+    from pathlib import Path
 
     from civex.court_ranking import ToolScoreBreakdown
-
+    tmp_path = Path(tmp_path)
     catalog_path = str(tmp_path / "test_hydrate_catalog.sqlite")
     conn = sqlite3.connect(catalog_path)
     conn.execute(

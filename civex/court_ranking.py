@@ -46,6 +46,102 @@ class ToolScoreBreakdown:
     rationale: str
     binary_sha256: str | None = None
     superseded_by: str | None = None
+    is_primary_sovereign: bool = False
+
+
+# ---------------------------------------------------------------------------
+# PRIMARY SOVEREIGN TOOLS & 2026 FORUM-SOURCED SUBSTITUTIONS
+# ---------------------------------------------------------------------------
+PRIMARY_SOVEREIGN_TOOLS: set[str] = {
+    # C1: Compilers, Systems & Acceleration (18)
+    "clang", "clang++", "make", "cmake", "ninja", "ccache", "zig", "rustc",
+    "cargo", "z3", "sqlite3", "duckdb", "b3sum", "zstd", "lz4", "pigz", "lldb", "otool",
+
+    # C2: High-Speed CLI Search, Ingestion & Data Wrangling (18)
+    "rg", "fd", "jaq", "jq", "qsv", "bat", "fzf", "glow", "tree", "hexyl",
+    "erd", "sd", "dust", "awk", "sed", "cut", "sort", "uniq",
+
+    # C3: Note-Taking, LaTeX, Derivation & Visual Graphing (16)
+    "nvim", "pandoc", "typst", "dot", "neato", "fdp", "sfdp", "circo", "twopi",
+    "tree-sitter", "ollama", "git", "diff", "patch", "bc", "strings",
+
+    # C4: Media Processing, Audio Engineering & Telemetry (18)
+    "ffmpeg", "ffprobe", "sox", "lame", "flac", "tmux", "htop", "hyperfine",
+    "fastfetch", "pv", "rclone", "rsync", "edge-tts", "afplay", "top", "iostat",
+    "vm_stat", "uptime",
+
+    # C5: Python Strategic Strike Force & Scientific Rig (16)
+    "python3", "ruff", "pytest", "uv", "yt-dlp", "nm", "ar", "ranlib", "strip",
+    "stat", "file", "basename", "dirname", "realpath", "mktemp", "readlink",
+
+    # C6: Core Networking, Infrastructure & Archival (14)
+    "gh", "zoxide", "eza", "delta", "curl", "wget", "openssl", "shasum", "tar",
+    "unzip", "gzip", "bzip2", "xz", "lsof",
+
+    # AIR10 Native Compiled Sovereign Wheels (13)
+    "air10-auto-trigger", "air10-fast-json", "air10-truth-guard", "air10-bloom-dedup",
+    "air10-regex-extract", "air10-unblockable-scraper", "air1-intent-hyper-rag",
+    "air1-generate-3x-audio", "air10-study", "air1-doctor", "gorun-fast", "swift-fast",
+    "macmon", "python_orjson_cli"
+}
+
+PRIMARY_TOOL_SUBSTITUTIONS: dict[str, str] = {
+    # Text, Search, Stream Editing
+    "cat": "bat",
+    "grep": "rg",
+    "egrep": "rg",
+    "fgrep": "rg",
+    "find": "fd",
+    "sed": "sd",
+    "awk": "jaq",
+    "gawk": "jaq",
+    "diff": "delta",
+    "ls": "eza",
+    "tree": "erd",
+    "hexdump": "hexyl",
+    "xxd": "hexyl",
+    "du": "dust",
+    "df": "dust",
+
+    # Hashing & Cryptography
+    "shasum": "b3sum",
+    "sha256sum": "b3sum",
+    "sha1sum": "b3sum",
+    "md5": "b3sum",
+    "md5sum": "b3sum",
+
+    # Compression & Archival
+    "gzip": "pigz",
+    "gunzip": "pigz",
+    "tar": "zstd",
+    "zip": "pigz",
+
+    # Telemetry, Monitoring & Hardware
+    "top": "macmon",
+    "ps": "macmon",
+    "time": "hyperfine",
+
+    # Network & Scraping
+    "curl": "air10-unblockable-scraper",
+    "wget": "air10-unblockable-scraper",
+
+    # Native AIR10 Sovereign Tools
+    "json": "air10-fast-json",
+    "json_parser": "air10-fast-json",
+    "json_validator": "air10-fast-json",
+    "bloom": "air10-bloom-dedup",
+    "bloom_filter": "air10-bloom-dedup",
+    "dedup": "air10-bloom-dedup",
+    "regex": "air10-regex-extract",
+    "regex_matcher": "air10-regex-extract",
+    "router": "air10-auto-trigger",
+    "intent_router": "air10-auto-trigger",
+    "truth_verifier": "air10-truth-guard",
+    "hash_verifier": "air10-truth-guard",
+    "audio_synth": "air1-generate-3x-audio",
+    "study_engine": "air10-study",
+    "doctor": "air1-doctor",
+}
 
 
 COURT_SECRET_KEY = os.environ.get("AIR10_COURT_SECRET_KEY", "air10_sovereign_court_master_secret_v9")
@@ -381,8 +477,13 @@ class CourtAwareRanker:
                 cur.execute(f"""
                     SELECT {select_cols}
                     FROM {target_table}
-                    WHERE tool_name = ? AND capability = ? AND input_format = '*' AND contract_version = '*'
-                """, (tool_name, capability))
+                    WHERE tool_name = ?
+                      AND (capability = ? OR capability = '*')
+                      AND (input_format = ? OR input_format = '*')
+                      AND (contract_version = ? OR contract_version = '*')
+                    ORDER BY (capability != '*') DESC, (input_format != '*') DESC, (contract_version != '*') DESC
+                    LIMIT 1
+                """, (tool_name, capability, input_format, contract_version))
                 row = cur.fetchone()
 
             # If no exact or wildcard contract registered: FAIL-CLOSED HOLD
@@ -446,7 +547,7 @@ class CourtAwareRanker:
                 correctness = 0.70
                 status = "WARNING"
                 rationale = f"ALLOWED_WITH_WARNING: {q_reason}"
-            elif q_status == "ALLOWED":
+            elif q_status in ("ALLOWED", "VERIFIED"):
                 correctness = 1.00
                 status = "ELIGIBLE"
                 rationale = f"VERIFIED_PASS: {q_reason}"
@@ -612,6 +713,8 @@ class CourtAwareRanker:
         # Multiplicative Utility Score
         final_score = correctness * 1.0 * latency_score * freshness * safety
 
+        is_primary = (tool_name in PRIMARY_SOVEREIGN_TOOLS or effective_id in PRIMARY_SOVEREIGN_TOOLS)
+
         return ToolScoreBreakdown(
             tool_name=tool_name,
             capability=capability,
@@ -626,7 +729,8 @@ class CourtAwareRanker:
             status=status,
             rationale=rationale,
             binary_sha256=actual_bin_sha or certified_sha,
-            superseded_by=superseded_by
+            superseded_by=superseded_by,
+            is_primary_sovereign=is_primary
         )
 
     def rank_candidates(
@@ -655,5 +759,5 @@ class CourtAwareRanker:
                 is_supervised=supervised,
                 tool_id=tool_id
             ))
-        scores.sort(key=lambda s: s.final_score, reverse=True)
+        scores.sort(key=lambda s: (s.status == "ELIGIBLE", s.is_primary_sovereign, s.final_score), reverse=True)
         return scores
