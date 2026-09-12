@@ -7,11 +7,13 @@ Runs 2,000 queries against the 10-tool catalog and measures:
 - Throughput (Queries/sec)
 """
 
+import hashlib
 import math
 import platform
 import re
 import sys
 import time
+from pathlib import Path
 
 TOOL_CATALOG = [
   {"id": "tool_git_commit_and_push", "name": "Git Auto Committer & Branch Push", "keywords": ["git", "commit", "push", "remote", "branch", "repository"], "summary": "Stage code, format conventional commit message and push to GitHub remote branch"},
@@ -125,7 +127,6 @@ def run_benchmark(rounds: int = 2000):
 
     
     import json
-    from pathlib import Path
     results = {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platform": f"{sys_name}-{machine}",
@@ -137,6 +138,7 @@ def run_benchmark(rounds: int = 2000):
         "p95_latency_us": round(p95_lat, 2),
         "p99_latency_us": round(p99_lat, 2),
         "throughput_qps": round(qps, 1),
+        "benchmark_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "status": "PASS"
     }
     out_file = Path(__file__).parent / "civex_benchmark_results.json"

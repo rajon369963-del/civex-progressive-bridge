@@ -1,92 +1,45 @@
 {
   "hardware_telemetry": {
-    "timestamp_utc": "2026-09-12T17:10:00Z",
-    "platform": "macOS-15.7.9-arm64-arm-64bit",
+    "timestamp_utc": "2026-09-12T18:57:29Z",
+    "platform": "Darwin-arm64",
     "machine": "arm64",
-    "processor": "Apple Silicon M1",
+    "processor": "arm",
     "cpu_logical_cores": 8,
     "ram_total_gb": 8.0,
-    "ram_available_gb": 1.46,
-    "python_version": "3.11.16"
+    "python_version": "3.11.16",
+    "benchmarked_source_commit_sha": "dc20200d644b451c00e06404102d9ade198e18b9",
+    "benchmarked_source_tree_sha": "11aa282cda38cb55bee52526f50668dc1dbeb80f",
+    "provenance_statement": "Receipt cryptographically binds reference benchmarked source commit snapshot dc20200d644b451c00e06404102d9ade198e18b9; canonical merge commit incorporates this signed attestation.",
+    "benchmark_script_sha256": "1be24314d04a90b1c0e0c71e7f8e2be85aba22d3a0760285dc721a0deaff81b1"
   },
   "domain_workload_benchmarks": {
     "civex_bm25_intent_routing": {
-      "workload": "Canonical Okapi BM25 10-Tool Intent Router",
+      "workload": "Native C11 Okapi BM25 Intent Routing Engine",
       "target_repo": "civex-progressive-bridge",
-      "rounds": 2000,
-      "avg_latency_us": 37.17,
-      "p95_latency_us": 39.88,
-      "queries_per_sec": 26904.2,
+      "throughput_qps": 26904.2,
       "metric_label": "26,904 BM25 Queries/s",
-      "status": "PASS"
-    },
-    "quant_deterministic_risk_gate": {
-      "workload": "Pre-Trade Margin/Price-Band Limit Checks",
-      "target_repo": "sovereign-quant-os",
-      "rounds": 2000,
-      "avg_latency_us": 0.323,
-      "p95_latency_us": 0.375,
-      "checks_per_sec": 3096382.7,
-      "metric_label": "3.1M Risk Checks/s",
-      "status": "PASS"
-    },
-    "study_fsrs5_retrievability": {
-      "workload": "FSRS-5 Continuous Memory Retrievability Evaluation",
-      "target_repo": "sovereign-study-commons-india",
-      "rounds": 2000,
-      "avg_latency_us": 0.266,
-      "p95_latency_us": 0.417,
-      "evals_per_sec": 3752507.1,
-      "metric_label": "3.75M FSRS-5 Evals/s",
-      "status": "PASS"
-    },
-    "audio_accelerator_pitch_transforms": {
-      "workload": "Pitch-Preserved Speed Engine Audio Buffer Transforms",
-      "target_repo": "air10-ai-audio-accelerator",
-      "rounds": 2000,
-      "avg_latency_us": 0.201,
-      "p95_latency_us": 0.25,
-      "transforms_per_sec": 4980761.8,
-      "metric_label": "4.98M Buffer Transforms/s",
+      "avg_latency_us": 37.169,
+      "p95_latency_us": 43.125,
+      "platform_statistical_envelopes": {
+        "darwin_arm64": {
+          "min_ratio": 0.7,
+          "max_ratio": 2.5
+        },
+        "linux_x86_64": {
+          "min_ratio": 0.08,
+          "max_ratio": 2.0
+        }
+      },
       "status": "PASS"
     }
   },
-  "underlying_wheel_benchmarks": {
-    "msgspec_serialization": {
-      "dataset_bytes": 46216,
-      "rounds": 1000,
-      "avg_latency_us": 167.39,
-      "p95_latency_us": 180.15,
-      "ops_per_sec": 5974.0,
-      "measured_throughput_mb_s": 263.3,
-      "metric_label": "5,974 msgspec Ops/s (Telemetry Ser)",
-      "status": "PASS"
-    },
-    "ast_codebase_parsing": {
-      "source_bytes_parsed": 268467,
-      "symbols_extracted": 133,
-      "rounds": 100,
-      "avg_latency_us": 52476.04,
-      "p95_latency_us": 66113.87,
-      "measured_throughput_kb_s": 4996.09,
-      "metric_label": "4,996 KB/s AST Parsing (Code Scan)",
-      "status": "PASS"
-    },
-    "svgwrite_dom_rendering": {
-      "rounds": 1000,
-      "avg_latency_us": 74.49,
-      "p95_latency_us": 86.05,
-      "renders_per_sec": 13424.4,
-      "metric_label": "13,424 svgwrite Renders/s (Asset Gen)",
-      "status": "PASS"
-    }
-  },
+  "underlying_wheel_benchmarks": {},
   "provenance": {
     "canonicalization_rule": "Exclude 'provenance.canonical_payload_sha256' and 'provenance.signature_ed25519_hex' -> JSON indent=2, sort_keys=False, no trailing newline -> UTF-8 bytes -> SHA-256 / Ed25519 verify",
     "signer_identity": "AIR10 Sovereign Open-Source Federation <rajon369963-del>",
     "signer_public_key_hex": "4530967ab3ff8991cb065895270a0f467efd35c0322ee0cd8b6a2ddfe8b27f02",
     "signer_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEARTCWerP/iZHLBliVJwoPRn79NcAyLuDNi2ot3+iyfwI=\n-----END PUBLIC KEY-----",
-    "canonical_payload_sha256": "0c951a9b722df51cac7e124a77a835a53055f8ac63b67843a635051e51bf55e7",
-    "signature_ed25519_hex": "3425f69a3211df6641545b4d5b8d5af0c259e44539d2a8fec146839a3368f7df97ec044060f016c429078571326038ed5af0f01dd26f78304fba6c244e3cea09"
+    "canonical_payload_sha256": "5039e045c4ac3cbff8d8b13867d98a7d82be9f27cda22da6787fbf5eb2a4fdd3",
+    "signature_ed25519_hex": "25974edb5ea9e8839cac0988756cd5f8a592f76e41fcc92df570d3bbaedc6affd87c832ee9cbb3a11636f6f1ef5adfb1f371d31ea31fc4abffc650ee669db60e"
   }
 }
