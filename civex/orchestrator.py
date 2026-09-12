@@ -19,6 +19,29 @@ from civex.trace_plumbing import (
 )
 
 
+def _is_exact_failed_candidate(candidate: dict[str, Any], chosen_tool: str, chosen_bin: str) -> bool:
+    """Return True only for the exact routed name+binary identity.
+
+    Display name alone is not a safe retry exclusion key: two independently
+    executable candidates may intentionally share a human-facing name.  The
+    router currently returns name+binary, so retry exclusion is bounded to
+    that exact pair until the wider canonical tool_id/contract tuple is
+    propagated end-to-end.
+    """
+    return candidate.get("name") == chosen_tool and candidate.get("binary") == chosen_bin
+
+
+def _exclude_failed_candidate(
+    candidates: list[dict[str, Any]], chosen_tool: str, chosen_bin: str
+) -> list[dict[str, Any]]:
+    """Remove only the exact routed candidate; preserve same-name alternates."""
+    return [
+        candidate
+        for candidate in candidates
+        if not _is_exact_failed_candidate(candidate, chosen_tool, chosen_bin)
+    ]
+
+
 def orchestrate_request(
     intent_query: str,
     required_capability: str,
@@ -29,18 +52,7 @@ def orchestrate_request(
     argv: list[str] | None = None,
     output_dir: str = "/tmp"
 ) -> dict[str, Any]:
-    """Executes a single intent request with autonomous same-request self-healing failover.
-    
-    Flow:
-    1. Layer 1: Emits root INTENT event.
-    2. Attempt loop (1..max_attempts):
-       a. Layer 2: Routes intent to optimal eligible candidate (skipping open-circuit tools).
-       b. Layer 3: Shim intercepts and records parent-child span correlation.
-       c. Layer 4: C11 execution boundary enforces content-addressed snapshots and expected SHA.
-       d. Layer 5: Strictly verifies execution trace, stores attempt in ledger, and updates circuit breaker.
-       e. If VERIFIED_PASS: returns success immediately.
-       f. If failure and attempts remain: automatically retries next alternate candidate.
-    """
+    """Executes a single intent request with autonomous same-request self-healing failover."""
     trace_id, span_intent_id = air10_layer1_intent.emit_intent(
         intent_name=required_capability,
         description=intent_query,
@@ -49,7 +61,6 @@ def orchestrate_request(
     )
 
     attempt_history = []
-
     active_candidates = list(candidate_pool) if candidate_pool is not None else None
 
     for attempt in range(1, max_attempts + 1):
@@ -106,7 +117,6 @@ def orchestrate_request(
             except Exception as cb_err:
                 raise RuntimeError(f"CIRCUIT_BREAKER_PERSISTENCE_FAILED_HOLD: Failed to update circuit breaker for {chosen_tool}: {cb_err}") from cb_err
 
-            # Mandatory Immutable Audit Ledger logging (Do NOT swallow persistence errors)
             air10_layer5_verifier.record_pre_execution_failure(
                 trace_id=trace_id,
                 attempt_no=attempt,
@@ -119,10 +129,11 @@ def orchestrate_request(
             )
 
             if active_candidates:
-                active_candidates = [c for c in active_candidates if c.get("name") != chosen_tool]
+                active_candidates = _exclude_failed_candidate(active_candidates, chosen_tool, chosen_bin)
             attempt_history.append({
                 "attempt": attempt,
                 "tool": chosen_tool,
+                "binary": chosen_bin,
                 "error": str(exec_err),
                 "verdict": "FAILED_BEFORE_EXECUTION"
             })
@@ -157,7 +168,7 @@ def orchestrate_request(
             }
 
         if active_candidates:
-            active_candidates = [c for c in active_candidates if c.get("name") != chosen_tool]
+            active_candidates = _exclude_failed_candidate(active_candidates, chosen_tool, chosen_bin)
 
     return {
         "status": "FAILED_MAX_ATTEMPTS_EXCEEDED",
