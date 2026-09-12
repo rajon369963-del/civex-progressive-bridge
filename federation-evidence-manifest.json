@@ -1,0 +1,142 @@
+{
+  "schema_version": "1.0",
+  "generated_at_utc": "2026-09-12T19:58:39.251466+00:00",
+  "trust_root": {
+    "authority": "AIR10 Sovereign Open-Source Federation",
+    "pinned_public_key_hex": "4530967ab3ff8991cb065895270a0f467efd35c0322ee0cd8b6a2ddfe8b27f02",
+    "signature_algorithm": "Ed25519"
+  },
+  "repositories": {
+    "air10-ai-audio-accelerator": {
+      "repository": "rajon369963-del/air10-ai-audio-accelerator",
+      "canonical_main_sha": "84c436b4c5e6eae2f5c13bf269f2239f4af0688b",
+      "canonical_main_tree_sha": "0be4e46f8ec1561fa0ddc94374dca5efdf0630b7",
+      "required_branch_contexts": [
+        "Test Matrix (Node 22.x)",
+        "Test Matrix (Node 24.x)",
+        "validate-and-test"
+      ],
+      "branch_protection_enforce_admins": true,
+      "receipt": {
+        "path": "db/STRESS_BENCHMARK_REAL_WHEELS.json",
+        "canonical_payload_sha256": "8ecd65f3f01528624006b47174e4f1773d585b5d3d92e916140a80328bb75852",
+        "recomputed_payload_sha256": "8ecd65f3f01528624006b47174e4f1773d585b5d3d92e916140a80328bb75852",
+        "ed25519_signature": "f22f17ccf79f9b4238a0732fd0e1d07a5598fd4c6cc7023858bf7730b1c3db53a1311a402cbbeba6555342bdd0e08d0ecb6d09950b890d5a6d765c7c6d3b1c00",
+        "attested_source_commit": "60396f92e69ec96e4159a32197b8e7e0805f48ac",
+        "attested_source_tree": "b901abaa6cf15e1bc10a347b84fb09abf96bab26",
+        "benchmark_script_sha256": "e3e1eaaa7623aeb12cbd556a21603d751328e9cfa40ef0a683e0dca10eee1eb5"
+      },
+      "pages": {
+        "url": "https://rajon369963-del.github.io/air10-ai-audio-accelerator/",
+        "status_code": 200,
+        "verdict": "HTTP_200_OK"
+      },
+      "forensic_status": {
+        "cryptographic_zero_drift": "PASS",
+        "presentation_zero_drift": "PASS",
+        "performance_conformance": "PASS",
+        "open_p0_count": 0,
+        "open_p1_count": 0
+      }
+    },
+    "civex-progressive-bridge": {
+      "repository": "rajon369963-del/civex-progressive-bridge",
+      "canonical_main_sha": "6380a971834ebc5815ab6530da2489823ee3e446",
+      "canonical_main_tree_sha": "bf8d5389ec777a19487267bee9c144784935c1af",
+      "required_branch_contexts": [
+        "test (ubuntu-latest, 3.10)",
+        "test (ubuntu-latest, 3.11)",
+        "test (ubuntu-latest, 3.12)",
+        "test (macos-latest, 3.10)",
+        "test (macos-latest, 3.11)",
+        "test (macos-latest, 3.12)",
+        "test-and-verify"
+      ],
+      "branch_protection_enforce_admins": true,
+      "receipt": {
+        "path": "db/STRESS_BENCHMARK_REAL_WHEELS.json",
+        "canonical_payload_sha256": "5039e045c4ac3cbff8d8b13867d98a7d82be9f27cda22da6787fbf5eb2a4fdd3",
+        "recomputed_payload_sha256": "5039e045c4ac3cbff8d8b13867d98a7d82be9f27cda22da6787fbf5eb2a4fdd3",
+        "ed25519_signature": "25974edb5ea9e8839cac0988756cd5f8a592f76e41fcc92df570d3bbaedc6affd87c832ee9cbb3a11636f6f1ef5adfb1f371d31ea31fc4abffc650ee669db60e",
+        "attested_source_commit": "dc20200d644b451c00e06404102d9ade198e18b9",
+        "attested_source_tree": "11aa282cda38cb55bee52526f50668dc1dbeb80f",
+        "benchmark_script_sha256": "1be24314d04a90b1c0e0c71e7f8e2be85aba22d3a0760285dc721a0deaff81b1"
+      },
+      "pages": {
+        "url": "https://rajon369963-del.github.io/civex-progressive-bridge/",
+        "status_code": 200,
+        "verdict": "HTTP_200_OK"
+      },
+      "forensic_status": {
+        "cryptographic_zero_drift": "PASS",
+        "presentation_zero_drift": "PASS",
+        "performance_conformance": "PASS",
+        "open_p0_count": 0,
+        "open_p1_count": 0
+      }
+    },
+    "sovereign-quant-os": {
+      "repository": "rajon369963-del/sovereign-quant-os",
+      "canonical_main_sha": "a1cbc4e67513fac2713b49bc9b96b9371b37f2ff",
+      "canonical_main_tree_sha": "35cfaa73106a7448cd3a99d58def5cf4499c87b3",
+      "required_branch_contexts": [
+        "verify",
+        "validate-showcase-and-kernel"
+      ],
+      "branch_protection_enforce_admins": true,
+      "receipt": {
+        "path": "db/STRESS_BENCHMARK_REAL_WHEELS.json",
+        "canonical_payload_sha256": "6c32ff899b9da50c77141ef024fe093aa7f2dd45cea8d025e101e1ff8c45456a",
+        "recomputed_payload_sha256": "6c32ff899b9da50c77141ef024fe093aa7f2dd45cea8d025e101e1ff8c45456a",
+        "ed25519_signature": "e684ff835a680636e79ec0cb7a378f7bde19573db0e847869861ae8a43a3fe6d4eda795d73b46addd4ce17d248127981a790c433c0c4ecf1585adbd70bd8d109",
+        "attested_source_commit": "f7862ce5f34615597d687a0b985c84133f2f65c2",
+        "attested_source_tree": "8cffc00440f50d53cd4a3375fd54fa308abafb1b",
+        "benchmark_script_sha256": "291866913c25de7c9dc9b1506a35a0174fc9fbeba3b90047726179272519ea81"
+      },
+      "pages": {
+        "url": "https://rajon369963-del.github.io/sovereign-quant-os/",
+        "status_code": 200,
+        "verdict": "HTTP_200_OK"
+      },
+      "forensic_status": {
+        "cryptographic_zero_drift": "PASS",
+        "presentation_zero_drift": "PASS",
+        "performance_conformance": "PASS",
+        "open_p0_count": 0,
+        "open_p1_count": 0
+      }
+    },
+    "sovereign-study-commons-india": {
+      "repository": "rajon369963-del/sovereign-study-commons-india",
+      "canonical_main_sha": "3715cfc96263bc338aecdc146817e7663435b675",
+      "canonical_main_tree_sha": "42056ab9481b7502f47070bcfa1362b34b7f67c3",
+      "required_branch_contexts": [
+        "verify-data-lake",
+        "prove-isolated-full-sha-write-boundary",
+        "validate-showcase-and-oracle"
+      ],
+      "branch_protection_enforce_admins": true,
+      "receipt": {
+        "path": "db/STRESS_BENCHMARK_REAL_WHEELS.json",
+        "canonical_payload_sha256": "e5d376eb3e0c53fb1ca148f4c0387c3cfbc557b511fc63007db63df44af77c76",
+        "recomputed_payload_sha256": "e5d376eb3e0c53fb1ca148f4c0387c3cfbc557b511fc63007db63df44af77c76",
+        "ed25519_signature": "f1feada1363963e41e632b242105871d33d8e3a4425a278ed1288a75721b000797a222472cbcc7244ae204f4fae464537fe47385575d8024c065ea9497ce970a",
+        "attested_source_commit": "f517b4dccd82cdd67d8e9478e95f279d3b3550a7",
+        "attested_source_tree": "078871772f0169a1c49ce19cf1c8eccfdcba44ea",
+        "benchmark_script_sha256": "da99ca756357baff11e01c0cf22e04b17d45e2a28a3f12d7e2e16d938cb0a890"
+      },
+      "pages": {
+        "url": "https://rajon369963-del.github.io/sovereign-study-commons-india/",
+        "status_code": 200,
+        "verdict": "HTTP_200_OK"
+      },
+      "forensic_status": {
+        "cryptographic_zero_drift": "PASS",
+        "presentation_zero_drift": "PASS",
+        "performance_conformance": "PASS",
+        "open_p0_count": 0,
+        "open_p1_count": 0
+      }
+    }
+  }
+}
