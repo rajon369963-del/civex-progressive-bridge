@@ -1,0 +1,47 @@
+{
+  "hardware_telemetry": {
+    "timestamp_utc": "2026-09-12T16:34:14Z",
+    "platform": "macOS-15.7.9-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "cpu_logical_cores": 8,
+    "ram_total_gb": 8.0,
+    "ram_available_gb": 1.46,
+    "python_version": "3.11.16"
+  },
+  "benchmarks": {
+    "real_serialization_msgspec": {
+      "dataset_bytes": 46216,
+      "rounds": 1000,
+      "py_json": {
+        "avg_latency_us": 169.88,
+        "ops_per_sec": 5886.3
+      },
+      "msgspec": {
+        "avg_latency_us": 167.39,
+        "p95_latency_us": 180.15,
+        "ops_per_sec": 5974.0,
+        "measured_throughput_mb_s": 263.3
+      },
+      "measured_speedup_x": 1.01,
+      "status": "PASS"
+    },
+    "real_ast_codebase_parsing": {
+      "source_bytes_parsed": 268467,
+      "symbols_extracted": 133,
+      "rounds": 100,
+      "avg_latency_us": 52476.04,
+      "p95_latency_us": 66113.87,
+      "measured_throughput_kb_s": 4996.09,
+      "status": "PASS"
+    },
+    "real_svgwrite_dom_rendering": {
+      "rounds": 1000,
+      "avg_latency_us": 74.49,
+      "p95_latency_us": 86.05,
+      "renders_per_sec": 13424.4,
+      "status": "PASS"
+    }
+  },
+  "cryptographic_sha256": "8ea82001a19d5a3d2065dcda9480118011244912a084c7b47734f20fdfd10889"
+}
