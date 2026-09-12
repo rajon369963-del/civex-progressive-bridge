@@ -7,6 +7,15 @@
 [![Platform: POSIX / macOS / Linux](https://img.shields.io/badge/Platform-POSIX-informational.svg)](https://github.com/rajon369963-del/civex-progressive-bridge)
 [![Catalog Scale: 5,283 Tools](https://img.shields.io/badge/Catalog-5%2C283%20Tools-success.svg)](https://github.com/rajon369963-del/civex-progressive-bridge)
 
+[![Agents: Supported](https://img.shields.io/badge/Agents-Supported-00f2fe.svg?style=flat-square)](./llms.txt)
+[![llms.txt: Active](https://img.shields.io/badge/llms.txt-Active-success.svg?style=flat-square)](./llms.txt)
+[![Zero-Install Demo](https://img.shields.io/badge/Demo-Try%20in%20Browser-blueviolet.svg?style=flat-square)](https://rajon369963-del.github.io/civex-progressive-bridge/)
+
+<p align="center">
+  <img src="./assets/scorecard.svg" alt="CIVEX Performance Scorecard" width="100%"/>
+</p>
+
+
 Modern agentic LLMs face severe context bloat and reasoning degradation when connected to comprehensive real-world tool registries. Injecting full schema definitions for thousands of tools into prompt context consumes over 400,000 tokens per invocation, exhausting context windows, inflating inference costs, and diluting model attention.
 
 **CIVEX Progressive Bridge** provides a progressive tool disclosure architecture for large-scale agent systems:
