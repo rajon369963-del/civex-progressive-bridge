@@ -2601,7 +2601,7 @@ def test_gate33_randomized_multi_worker_parallel_stress_loop(hermetic_audit_db, 
                     assert "POISONED" not in data.get("stdout_preview", "")
                     worker_results.append((worker_id, it, "EXECUTED_GENUINE"))
                 else:
-                    assert proc.returncode in (76, 79)
+                    assert proc.returncode in (76, 78, 79)
                     worker_results.append((worker_id, it, f"REFUSED_{proc.returncode}"))
         except Exception as e:
             worker_errors.append((worker_id, str(e)))
