@@ -15,7 +15,9 @@ jobs:
     env:
       AIR10_EXEC_BOUNDARY: /tmp/air10_exec_boundary
     steps:
-      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
