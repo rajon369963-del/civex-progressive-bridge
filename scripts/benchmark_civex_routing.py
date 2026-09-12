@@ -123,6 +123,26 @@ def run_benchmark(rounds: int = 2000):
     assert len(matched_tools) == len(queries), "Query match count mismatch"
     assert qps > 1000.0, f"Throughput too low ({qps} < 1000 qps)"
 
+    
+    import json
+    from pathlib import Path
+    results = {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "platform": f"{sys_name}-{machine}",
+        "machine": machine,
+        "processor": proc,
+        "python_version": py_ver,
+        "total_queries": rounds,
+        "avg_latency_us": round(avg_lat, 2),
+        "p95_latency_us": round(p95_lat, 2),
+        "p99_latency_us": round(p99_lat, 2),
+        "throughput_qps": round(qps, 1),
+        "status": "PASS"
+    }
+    out_file = Path(__file__).parent / "civex_benchmark_results.json"
+    out_file.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    print(f"• Saved live benchmark results to {out_file.name}")
+
     print("----------------------------------------------------------------------")
     print("✅ VERDICT: OKAPI BM25 ROUTER MEETS SPEED SPECIFICATION.")
     print("======================================================================\n")

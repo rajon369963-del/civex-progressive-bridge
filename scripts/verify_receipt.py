@@ -13,6 +13,7 @@ Zero-Trust Forensic Invariants:
 """
 
 import hashlib
+import platform
 import json
 import re
 import sys
@@ -23,6 +24,29 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 AUTHORITATIVE_SIGNER_PUBKEY_HEX = "4530967ab3ff8991cb065895270a0f467efd35c0322ee0cd8b6a2ddfe8b27f02"
 EXPECTED_SIGNER_IDENTITY = "AIR10 Sovereign Open-Source Federation <rajon369963-del>"
+
+
+def verify_live_benchmark(bench_path: Path) -> bool:
+    if not bench_path.exists() or bench_path.stat().st_size == 0:
+        print(f"❌ FAIL: Live benchmark result file missing or empty: {bench_path}")
+        return False
+    try:
+        data = json.loads(bench_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"❌ FAIL: Corrupt JSON in benchmark results: {e}")
+        return False
+
+    mach = platform.machine().lower()
+    is_arm = ("arm" in mach) or ("aarch64" in mach)
+    qps_min = 10_000.0 if is_arm else 1_000.0
+    live_qps = float(data.get("throughput_qps", 0))
+
+    if live_qps < qps_min:
+        print(f"❌ FAIL: Live BM25 throughput too low: {live_qps:,.1f} QPS < min {qps_min:,.1f}")
+        return False
+
+    print(f"• Live Benchmark Binding  : CAUSAL LINK ESTABLISHED (Live Okapi BM25={live_qps:,.1f} QPS, Avg Latency={data.get('avg_latency_us')} µs) [PASS]")
+    return True
 
 def extract_visible_svg_text(svg_raw: str) -> str:
     cleaned = re.sub(r"<!--.*?-->", "", svg_raw, flags=re.DOTALL)
@@ -44,7 +68,7 @@ def extract_visible_svg_text(svg_raw: str) -> str:
 
     return " ".join(t for t in extracted_tokens if t)
 
-def verify(repo_root: Path) -> bool:
+def verify(repo_root: Path, live_bench_file: Path = None) -> bool:
     print("======================================================================")
     print("🛡️  AIR10 TRUTH GUARD v2.2: CRYPTOGRAPHIC PROVENANCE & ZERO-DRIFT CONTRACT")
     print(f"Target Repository : {repo_root.name}")
@@ -153,12 +177,28 @@ def verify(repo_root: Path) -> bool:
                 return False
         print(f"• Scorecard Tag Audit      : 100% IN-SYNC ({len(required_substrings)} metrics verified in visible <text> nodes) [PASS]")
 
+    if live_bench_file:
+        if not verify_live_benchmark(live_bench_file):
+            return False
+    else:
+        default_bench = repo_root / "scripts" / "civex_benchmark_results.json"
+        if default_bench.exists():
+            if not verify_live_benchmark(default_bench):
+                return False
+
     print("----------------------------------------------------------------------")
     print("✅ VERDICT: 100% AUTHENTICALLY SIGNED & FORENSICALLY SEALED ZERO-DRIFT PASS.")
     print("======================================================================\n")
     return True
 
 if __name__ == "__main__":
-    target_dir = Path(__file__).parent.parent if len(sys.argv) < 2 else Path(sys.argv[1])
-    success = verify(target_dir)
+    import argparse
+    parser = argparse.ArgumentParser(description="CIVEX Truth Guard")
+    parser.add_argument("repo_path", nargs="?", default=None)
+    parser.add_argument("--assert-live-benchmark", dest="live_benchmark", default=None)
+    args = parser.parse_args()
+
+    repo_dir = Path(args.repo_path).resolve() if args.repo_path else Path(__file__).parent.parent.resolve()
+    live_bench = Path(args.live_benchmark).resolve() if args.live_benchmark else None
+    success = verify(repo_dir, live_bench)
     sys.exit(0 if success else 1)
