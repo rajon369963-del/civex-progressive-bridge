@@ -44,12 +44,25 @@ jobs:
       - name: Execute Standalone Okapi BM25 Benchmark Reproducer
         run: |
           python3 scripts/benchmark_civex_routing.py
-      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
-        run: |
-          python3 scripts/verify_receipt.py --assert-live-benchmark scripts/civex_benchmark_results.json
 
-      - name: Upload Live Benchmark Artifact
+      - name: Upload Live Benchmark Artifact (Preserve Evidence Even on Failure)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-civex-benchmark-results
           path: scripts/civex_benchmark_results.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
+        run: |
+          python3 scripts/verify_receipt.py --assert-live-benchmark scripts/civex_benchmark_results.json 2>&1 | tee /tmp/civex_forensic_verification_report.txt
+
+      - name: Upload Forensic Verification Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: civex-forensic-verification-report
+          path: /tmp/civex_forensic_verification_report.txt
+          if-no-files-found: warn
+          retention-days: 90
