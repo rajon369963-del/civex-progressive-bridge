@@ -1,7 +1,7 @@
 name: CIVEX Autonomous Showcase & Test Circuit
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "feat/**" ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -27,36 +27,67 @@ jobs:
         with:
           node-version: "20"
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio cryptography
           pip install -e .
       - name: Compile C11 Execution Boundary
+        shell: bash
         run: |
           cc -O3 -std=c11 civex/trace_plumbing/air10_exec_boundary.c -o /tmp/air10_exec_boundary
           chmod +x /tmp/air10_exec_boundary
       - name: Run Court & Bridge Invariant Tests
+        shell: bash
         run: |
           pytest tests/ -v
       - name: Run Browser JavaScript Okapi BM25 Execution Tests via Node.js
+        shell: bash
         run: |
           node tests/test_browser_bm25_execution.mjs
       - name: Execute Standalone Okapi BM25 Benchmark Reproducer
+        shell: bash
         run: |
-          python3 scripts/benchmark_civex_routing.py
+          python3 scripts/run_benchmark_with_tombstone.py \
+            --repo "rajon369963-del/civex-progressive-bridge" \
+            --benchmark-cmd "python3 scripts/benchmark_civex_routing.py" \
+            --expected-output "scripts/civex_benchmark_results.json" \
+            --status-output "scripts/benchmark_status.json" \
+            --stdout-log "scripts/benchmark_stdout.log" \
+            --stderr-log "scripts/benchmark_stderr.log"
 
       - name: Upload Live Benchmark Artifact (Preserve Evidence Even on Failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-civex-benchmark-results
-          path: scripts/civex_benchmark_results.json
+          path: |
+            scripts/civex_benchmark_results.json
+            scripts/benchmark_status.json
+            scripts/benchmark_stdout.log
+            scripts/benchmark_stderr.log
           if-no-files-found: warn
           retention-days: 90
 
-      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
+      - name: Run Permanent Adversarial Canary Regression Suite
+        shell: bash
         run: |
+          python3 tests/test_adversarial_receipt_canaries.py
+
+      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
           python3 scripts/verify_receipt.py --assert-live-benchmark scripts/civex_benchmark_results.json 2>&1 | tee /tmp/civex_forensic_verification_report.txt
+          verifier_rc=${PIPESTATUS[0]}
+          printf '\nVERIFIER_EXIT_CODE=%s\n' "$verifier_rc" | tee -a /tmp/civex_forensic_verification_report.txt
+          exit "$verifier_rc"
+
+      - name: Verify Federation Evidence Manifest
+        shell: bash
+        run: |
+          python3 scripts/verify_federation_manifest.py --verify federation-evidence-manifest.json --repo civex-progressive-bridge
 
       - name: Upload Forensic Verification Report
         if: always()
