@@ -111,17 +111,19 @@ def verify_live_benchmark(bench_path: Path, receipt_data: dict, repo_root: Path)
     print(f"Live Benchmark File     : {bench_path.name}")
     print(f"Execution Timestamp UTC : {live_data.get('timestamp_utc', 'N/A')}")
 
-    # 1. Script SHA verification
+    # 1. Script SHA verification (MANDATORY FAIL-HARD)
     telemetry = receipt_data.get("hardware_telemetry", {})
     attested_script_sha = telemetry.get("benchmark_script_sha256")
     live_script_sha = live_data.get("benchmark_script_sha256")
-    if live_script_sha and attested_script_sha:
-        if live_script_sha != attested_script_sha:
-            print("❌ FAIL: Live benchmark executed a tampered benchmark script!")
-            print(f"  Attested Script SHA : {attested_script_sha}")
-            print(f"  Live Run Script SHA : {live_script_sha}")
-            return False
-        print("• Benchmark Executable Hash : BOUND TO ATTESTED SCRIPT [PASS]")
+    if not live_script_sha:
+        print("❌ FAIL: Live benchmark JSON missing self-attesting benchmark_script_sha256!")
+        return False
+    if live_script_sha != attested_script_sha:
+        print("❌ FAIL: Live benchmark executed a tampered benchmark script!")
+        print(f"  Attested Script SHA : {attested_script_sha}")
+        print(f"  Live Run Script SHA : {live_script_sha}")
+        return False
+    print("• Benchmark Executable Hash : BOUND TO ATTESTED SCRIPT [PASS]")
 
     # 2. Platform detection & statistical envelope
     host_platform = platform.system().lower()
@@ -281,6 +283,20 @@ def verify(repo_root: Path, live_bench_file: Path = None) -> bool:
         if sig_hex[:32] not in visible_svg_text:
             print(f"❌ FAIL: Scorecard visible text missing signature prefix {sig_hex[:32]}")
             return False
+
+        # Visual zero-drift verification of displayed provenance fields
+        telemetry = data.get("hardware_telemetry", {})
+        bench_commit = telemetry.get("benchmarked_source_commit_sha")
+        expected_tree = telemetry.get("benchmarked_source_tree_sha")
+        raw_svg_text = svg_path.read_text(encoding="utf-8")
+        if bench_commit and bench_commit[:8] in raw_svg_text:
+            if bench_commit[:8] not in visible_svg_text:
+                print(f"❌ FAIL: Scorecard visible text missing attested commit prefix {bench_commit[:8]}")
+                return False
+        if expected_tree and expected_tree[:8] in raw_svg_text:
+            if expected_tree[:8] not in visible_svg_text:
+                print(f"❌ FAIL: Scorecard visible text missing attested tree prefix {expected_tree[:8]}")
+                return False
 
         # Dynamically extract all metric labels from receipt to assert zero-drift
         repo_name = repo_root.name
