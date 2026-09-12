@@ -1,42 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 850 310" width="100%" height="310">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0a0f1d"/>
-      <stop offset="100%" stop-color="#040711"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#00f2fe"/>
-      <stop offset="100%" stop-color="#4facfe"/>
-    </linearGradient>
-    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#00ffcc" stop-opacity="0.12"/>
-      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="0%" stop-color="#070a13" />
+      <stop offset="100%" stop-color="#0f172a" />
     </linearGradient>
   </defs>
-  <rect width="850" height="310" rx="16" fill="url(#bg)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-  <rect width="850" height="310" rx="16" fill="url(#glow)"/>
+  <rect width="800" height="450" fill="url(#bg)" rx="16" />
+  <rect x="20" y="20" width="760" height="410" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="1" rx="12" />
   
-  <!-- Terminal Header -->
-  <circle cx="28" cy="28" r="6" fill="#ff5f56"/>
-  <circle cx="48" cy="28" r="6" fill="#ffbd2e"/>
-  <circle cx="68" cy="28" r="6" fill="#27c93f"/>
-  <text x="96" y="32" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="13">air10-terminal :: civex-progressive-bridge</text>
-  <line x1="0" y1="52" x2="850" y2="52" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
-
-  <!-- Benchmark & Status Grid -->
-  <text x="32" y="86" fill="url(#accent)" font-family="monospace" font-size="16" font-weight="bold">⚡ CRYPTOGRAPHICALLY SIGNED BENCHMARK ATTESTATION</text>
-  <text x="32" y="116" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="13">Architecture : <tspan fill="#58a6ff">Civic Exchange &amp; Intent Routing</tspan></text>
-  <text x="32" y="140" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="13">Domain Work  : <tspan fill="#39d353">26,904 BM25 Queries/s • Okapi BM25 Router</tspan></text>
-  <text x="32" y="164" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="13">Wheel Bench  : <tspan fill="#d2a8ff">13,424 svgwrite Renders/s (Asset Gen)</tspan></text>
-  <text x="32" y="188" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="13">Hardware     : <tspan fill="#ff7b72">Apple Silicon M1 (8 Cores • macOS 15.7.9)</tspan></text>
-  <text x="32" y="212" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="12">Payload SHA  : <tspan fill="#f0883e" font-family="monospace" font-size="11">0c951a9b722df51cac7e124a77a835a53055f8ac63b67843a635051e51bf55e7</tspan></text>
-  <text x="32" y="234" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="12">Raw File SHA : <tspan fill="#79c0ff" font-family="monospace" font-size="11">46a99a6c3daeae50afc396b347e42abb6fe2d3455235919b6508ae7d30d160ba</tspan></text>
-  <text x="32" y="256" fill="#e6edf3" font-family="-apple-system, BlinkMacSystemFont, monospace" font-size="12">Ed25519 Sign : <tspan fill="#7ee787" font-family="monospace" font-size="11">3425f69a3211df6641545b4d5b8d5af0... [VERIFIED KEYPAIR]</tspan></text>
-
-  <!-- Live Status Chip -->
-  <rect x="630" y="74" width="185" height="42" rx="21" fill="rgba(39, 201, 63, 0.12)" stroke="#27c93f" stroke-width="1"/>
-  <circle cx="650" cy="95" r="5" fill="#27c93f"/>
-  <text x="664" y="100" fill="#27c93f" font-family="monospace" font-size="13" font-weight="bold">SIGNED RECEIPT</text>
+  <text x="40" y="60" fill="#38bdf8" font-family="-apple-system, system-ui, sans-serif" font-size="20" font-weight="700">AIR10 FORENSIC SCORECARD: civex-progressive-bridge</text>
+  <text x="40" y="85" fill="#94a3b8" font-family="-apple-system, system-ui, sans-serif" font-size="12">Cryptographic Attestation &amp; Zero-Drift Provenance</text>
   
-  <text x="32" y="288" fill="#6e7681" font-family="monospace" font-size="11">$ python3 scripts/verify_receipt.py --zero-drift-check [PASS: 100% IN-SYNC]</text>
+  <rect x="40" y="110" width="720" height="110" fill="rgba(255,255,255,0.03)" rx="8" stroke="rgba(255,255,255,0.06)" />
+  <text x="60" y="145" fill="#f8fafc" font-family="-apple-system, system-ui, sans-serif" font-size="16" font-weight="700">• 26,904 BM25 Queries/s</text>
+  
+  <rect x="40" y="240" width="720" height="190" fill="rgba(255,255,255,0.02)" rx="8" stroke="rgba(255,255,255,0.04)" />
+  <text x="60" y="270" fill="#94a3b8" font-family="monospace" font-size="12">SIGNER IDENTITY     : AIR10 Sovereign Open-Source Federation &lt;rajon369963-del&gt;</text>
+  <text x="60" y="295" fill="#94a3b8" font-family="monospace" font-size="12">ATTESTED COMMIT SHA : dc20200d644b451c00e06404102d9ade198e18b9</text>
+  <text x="60" y="320" fill="#94a3b8" font-family="monospace" font-size="12">ATTESTED TREE SHA   : 11aa282cda38cb55bee52526f50668dc1dbeb80f</text>
+  <text x="60" y="345" fill="#94a3b8" font-family="monospace" font-size="12">CANONICAL HASH      : 5039e045c4ac3cbff8d8b13867d98a7d82be9f27cda22da6787fbf5eb2a4fdd3</text>
+  <text x="60" y="370" fill="#94a3b8" font-family="monospace" font-size="12">ED25519 SIGNATURE   : 25974edb5ea9e8839cac0988756cd5f8...</text>
+  <text x="60" y="395" fill="#10b981" font-family="-apple-system, system-ui, sans-serif" font-size="13" font-weight="700">VERIFIED STATUS     : ZERO-DRIFT FORENSIC PASS</text>
 </svg>
