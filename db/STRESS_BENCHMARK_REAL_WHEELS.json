@@ -1,47 +1,92 @@
 {
   "hardware_telemetry": {
-    "timestamp_utc": "2026-09-12T16:34:14Z",
+    "timestamp_utc": "2026-09-12T17:10:00Z",
     "platform": "macOS-15.7.9-arm64-arm-64bit",
     "machine": "arm64",
-    "processor": "arm",
+    "processor": "Apple Silicon M1",
     "cpu_logical_cores": 8,
     "ram_total_gb": 8.0,
     "ram_available_gb": 1.46,
     "python_version": "3.11.16"
   },
-  "benchmarks": {
-    "real_serialization_msgspec": {
-      "dataset_bytes": 46216,
-      "rounds": 1000,
-      "py_json": {
-        "avg_latency_us": 169.88,
-        "ops_per_sec": 5886.3
-      },
-      "msgspec": {
-        "avg_latency_us": 167.39,
-        "p95_latency_us": 180.15,
-        "ops_per_sec": 5974.0,
-        "measured_throughput_mb_s": 263.3
-      },
-      "measured_speedup_x": 1.01,
+  "domain_workload_benchmarks": {
+    "civex_bm25_intent_routing": {
+      "workload": "Canonical Okapi BM25 10-Tool Intent Router",
+      "target_repo": "civex-progressive-bridge",
+      "rounds": 2000,
+      "avg_latency_us": 37.17,
+      "p95_latency_us": 39.88,
+      "queries_per_sec": 26904.2,
+      "metric_label": "26,904 BM25 Queries/s",
       "status": "PASS"
     },
-    "real_ast_codebase_parsing": {
+    "quant_deterministic_risk_gate": {
+      "workload": "Pre-Trade Margin/Price-Band Limit Checks",
+      "target_repo": "sovereign-quant-os",
+      "rounds": 2000,
+      "avg_latency_us": 0.323,
+      "p95_latency_us": 0.375,
+      "checks_per_sec": 3096382.7,
+      "metric_label": "3.1M Risk Checks/s",
+      "status": "PASS"
+    },
+    "study_fsrs5_retrievability": {
+      "workload": "FSRS-5 Continuous Memory Retrievability Evaluation",
+      "target_repo": "sovereign-study-commons-india",
+      "rounds": 2000,
+      "avg_latency_us": 0.266,
+      "p95_latency_us": 0.417,
+      "evals_per_sec": 3752507.1,
+      "metric_label": "3.75M FSRS-5 Evals/s",
+      "status": "PASS"
+    },
+    "audio_accelerator_pitch_transforms": {
+      "workload": "Pitch-Preserved Speed Engine Audio Buffer Transforms",
+      "target_repo": "air10-ai-audio-accelerator",
+      "rounds": 2000,
+      "avg_latency_us": 0.201,
+      "p95_latency_us": 0.25,
+      "transforms_per_sec": 4980761.8,
+      "metric_label": "4.98M Buffer Transforms/s",
+      "status": "PASS"
+    }
+  },
+  "underlying_wheel_benchmarks": {
+    "msgspec_serialization": {
+      "dataset_bytes": 46216,
+      "rounds": 1000,
+      "avg_latency_us": 167.39,
+      "p95_latency_us": 180.15,
+      "ops_per_sec": 5974.0,
+      "measured_throughput_mb_s": 263.3,
+      "metric_label": "5,974 msgspec Ops/s (Telemetry Ser)",
+      "status": "PASS"
+    },
+    "ast_codebase_parsing": {
       "source_bytes_parsed": 268467,
       "symbols_extracted": 133,
       "rounds": 100,
       "avg_latency_us": 52476.04,
       "p95_latency_us": 66113.87,
       "measured_throughput_kb_s": 4996.09,
+      "metric_label": "4,996 KB/s AST Parsing (Code Scan)",
       "status": "PASS"
     },
-    "real_svgwrite_dom_rendering": {
+    "svgwrite_dom_rendering": {
       "rounds": 1000,
       "avg_latency_us": 74.49,
       "p95_latency_us": 86.05,
       "renders_per_sec": 13424.4,
+      "metric_label": "13,424 svgwrite Renders/s (Asset Gen)",
       "status": "PASS"
     }
   },
-  "cryptographic_sha256": "8ea82001a19d5a3d2065dcda9480118011244912a084c7b47734f20fdfd10889"
+  "provenance": {
+    "canonicalization_rule": "Exclude 'provenance.canonical_payload_sha256' and 'provenance.signature_ed25519_hex' -> JSON indent=2, sort_keys=False, no trailing newline -> UTF-8 bytes -> SHA-256 / Ed25519 verify",
+    "signer_identity": "AIR10 Sovereign Open-Source Federation <rajon369963-del>",
+    "signer_public_key_hex": "4530967ab3ff8991cb065895270a0f467efd35c0322ee0cd8b6a2ddfe8b27f02",
+    "signer_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEARTCWerP/iZHLBliVJwoPRn79NcAyLuDNi2ot3+iyfwI=\n-----END PUBLIC KEY-----",
+    "canonical_payload_sha256": "0c951a9b722df51cac7e124a77a835a53055f8ac63b67843a635051e51bf55e7",
+    "signature_ed25519_hex": "3425f69a3211df6641545b4d5b8d5af0c259e44539d2a8fec146839a3368f7df97ec044060f016c429078571326038ed5af0f01dd26f78304fba6c244e3cea09"
+  }
 }

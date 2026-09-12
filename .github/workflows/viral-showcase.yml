@@ -20,10 +20,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio cryptography
           pip install -e .
       - name: Compile C11 Execution Boundary
         run: |
@@ -32,3 +36,9 @@ jobs:
       - name: Run Court & Bridge Invariant Tests
         run: |
           pytest tests/ -v
+      - name: Run Browser JavaScript Okapi BM25 Execution Tests via Node.js
+        run: |
+          node tests/test_browser_bm25_execution.mjs
+      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
+        run: |
+          python3 scripts/verify_receipt.py
