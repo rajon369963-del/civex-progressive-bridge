@@ -39,9 +39,9 @@ jobs:
       - name: Run Browser JavaScript Okapi BM25 Execution Tests via Node.js
         run: |
           node tests/test_browser_bm25_execution.mjs
-      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
-        run: |
-          python3 scripts/verify_receipt.py
       - name: Execute Standalone Okapi BM25 Benchmark Reproducer
         run: |
           python3 scripts/benchmark_civex_routing.py
+      - name: Verify Cryptographic Receipt & Scorecard Zero-Drift
+        run: |
+          python3 scripts/verify_receipt.py --assert-live-benchmark scripts/civex_benchmark_results.json
