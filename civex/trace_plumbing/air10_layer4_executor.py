@@ -18,6 +18,7 @@ import uuid
 
 DB_PATH = os.environ.get("AIR10_AUDIT_DB", "/Users/rajondas/.antigravity/air10_audit.db")
 SUPERVISOR_BIN = os.environ.get("AIR10_EXEC_BOUNDARY", "/Users/rajondas/.local/bin/air10_exec_boundary")
+REPOSITORY_KNOWN_COURT_KEYS = frozenset({"air10_sovereign_court_master_secret_v9"})
 
 class ExecutionTimeoutError(subprocess.TimeoutExpired, RuntimeError):
     """Raised when supervised tool execution exceeds configured deadline."""
@@ -75,6 +76,11 @@ def execute_process(
             raise RuntimeError(
                 "COURT_AUTHORITY_KEY_UNAVAILABLE_HOLD: AIR10_COURT_SECRET_KEY is missing; "
                 "repository fallback signing material cannot authorize physical execution"
+            )
+        if authority_key in REPOSITORY_KNOWN_COURT_KEYS:
+            raise RuntimeError(
+                "COURT_AUTHORITY_KEY_REJECTED_HOLD: AIR10_COURT_SECRET_KEY matches repository-known "
+                "fallback signing material and cannot establish independent Court authority"
             )
         if not active_db or not os.path.isfile(active_db):
             raise RuntimeError(
