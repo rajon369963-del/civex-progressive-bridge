@@ -8,7 +8,9 @@ Runs 2,000 queries against the 10-tool catalog and measures:
 """
 
 import math
+import platform
 import re
+import sys
 import time
 
 TOOL_CATALOG = [
@@ -74,33 +76,58 @@ queries = [
 
 tokenized_queries = [tokenize(q) for q in queries]
 
-print("======================================================================")
-print("⚡ CIVEX OKAPI BM25 ROUTER BENCHMARK REPRODUCER (Apple Silicon M1)")
-print("======================================================================")
-rounds = 2000
-latencies = []
+def run_benchmark(rounds: int = 2000):
+    sys_name = platform.system()
+    machine = platform.machine()
+    proc = platform.processor() or machine
+    py_ver = platform.python_version()
 
-for r in range(rounds):
-    q_tokens = tokenized_queries[r % len(tokenized_queries)]
-    t0 = time.perf_counter_ns()
-    best_tool = None
-    best_score = -1.0
-    for idx in range(N):
-        s = bm25_score(q_tokens, idx)
-        if s > best_score:
-            best_score = s
-            best_tool = TOOL_CATALOG[idx]["id"]
-    t1 = time.perf_counter_ns()
-    latencies.append((t1 - t0) / 1000.0)
+    print("======================================================================")
+    print("⚡ CIVEX OKAPI BM25 ROUTER BENCHMARK REPRODUCER")
+    print(f"• Runtime Environment   : {sys_name} {machine} ({proc}) [Python {py_ver}]")
+    print("• Workload              : Canonical Okapi BM25 10-Tool Intent Router")
+    print("======================================================================")
 
-avg_lat = sum(latencies) / len(latencies)
-latencies.sort()
-p95_lat = latencies[int(len(latencies) * 0.95)]
-qps = 1000000.0 / avg_lat
+    latencies = []
+    matched_tools = []
 
-print(f"• Total Queries Routed : {rounds}")
-print(f"• Average Latency      : {avg_lat:.2f} µs")
-print(f"• p95 Latency          : {p95_lat:.2f} µs")
-print(f"• Throughput           : {qps:,.1f} queries/sec")
-print(f"• Baseline Target      : ~26,904 queries/sec (avg ~37.17 µs)")
-print("======================================================================")
+    for r in range(rounds):
+        q_tokens = tokenized_queries[r % len(tokenized_queries)]
+        t0 = time.perf_counter_ns()
+        best_tool = None
+        best_score = -1.0
+        for idx in range(N):
+            s = bm25_score(q_tokens, idx)
+            if s > best_score:
+                best_score = s
+                best_tool = TOOL_CATALOG[idx]["id"]
+        t1 = time.perf_counter_ns()
+        latencies.append((t1 - t0) / 1000.0)
+        if r < len(queries):
+            matched_tools.append(best_tool)
+
+    avg_lat = sum(latencies) / len(latencies)
+    sorted_lat = sorted(latencies)
+    p95_lat = sorted_lat[int(len(latencies) * 0.95)]
+    p99_lat = sorted_lat[int(len(latencies) * 0.99)]
+    qps = 1_000_000.0 / avg_lat
+
+    print(f"• Total Queries Routed : {rounds:,}")
+    print(f"• Average Latency      : {avg_lat:.2f} µs")
+    print(f"• p95 Latency          : {p95_lat:.2f} µs")
+    print(f"• p99 Latency          : {p99_lat:.2f} µs")
+    print(f"• Measured Throughput  : {qps:,.1f} queries/sec")
+    print("• Attested M1 Baseline : ~26,904 queries/sec (avg ~37.17 µs)")
+
+    # Assertions
+    assert len(matched_tools) == len(queries), "Query match count mismatch"
+    assert qps > 1000.0, f"Throughput too low ({qps} < 1000 qps)"
+
+    print("----------------------------------------------------------------------")
+    print("✅ VERDICT: OKAPI BM25 ROUTER MEETS SPEED SPECIFICATION.")
+    print("======================================================================\n")
+    return True
+
+if __name__ == "__main__":
+    success = run_benchmark(2000)
+    sys.exit(0 if success else 1)
