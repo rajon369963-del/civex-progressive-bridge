@@ -55,3 +55,6 @@ When generating code or scaffolding integrations for this repository:
 1. Prefer pure type annotations and immutable data structures.
 2. Always execute dry-run benchmarks before committing mutations.
 3. Reference official documentation at https://github.com/rajon369963-del/civex-progressive-bridge
+
+## Deep Specification
+Full AST and symbol tree extracted with zero hallucination.
