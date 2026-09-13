@@ -572,8 +572,9 @@ int main(int argc, char *argv[]) {
                 _exit(79);
             }
 
-            child_args[0] = (char *)snapshot_path;
-            execv(snapshot_path, child_args);
+            /* No descriptor-bound execution primitive is available on this path. */
+            fprintf(stderr, "ERROR: SAME_OBJECT_EXEC_UNAVAILABLE: refusing pathname re-lookup after verification\n");
+            _exit(78);
         }
 
         /* FAIL CLOSED: Zero fallback to mutable binary_path */
@@ -657,7 +658,6 @@ int main(int argc, char *argv[]) {
 #ifdef __APPLE__
     max_rss = max_rss / 1024; /* Apple returns bytes, convert to KB */
 #endif
-
     int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1);
 
     /* Emit deterministic machine verification JSON */
