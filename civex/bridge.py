@@ -947,12 +947,21 @@ class CivexProgressiveBridge:
 
             if p_name in params:
                 val = params[p_name]
-                if p_contract.expected_type in (int, float):
+                if p_contract.expected_type is int:
+                    if not isinstance(val, int) or isinstance(val, bool):
+                        val_str = str(val)[:50]
+                        return build_error_envelope(
+                            CivexErrorCode.SCHEMA_MISMATCH,
+                            f"Parameter '{p_name}' expects int, got {type(val).__name__} with value: {val_str}",
+                            rpc_id=rpc_id,
+                            details={'rejected_param': p_name, 'raw_sample': val_str},
+                        )
+                elif p_contract.expected_type is float:
                     if not isinstance(val, (int, float)) or isinstance(val, bool):
                         val_str = str(val)[:50]
                         return build_error_envelope(
                             CivexErrorCode.SCHEMA_MISMATCH,
-                            f"Parameter '{p_name}' expects numeric type {p_contract.expected_type.__name__}, got {type(val).__name__} with value: {val_str}",
+                            f"Parameter '{p_name}' expects numeric type float, got {type(val).__name__} with value: {val_str}",
                             rpc_id=rpc_id,
                             details={'rejected_param': p_name, 'raw_sample': val_str},
                         )
