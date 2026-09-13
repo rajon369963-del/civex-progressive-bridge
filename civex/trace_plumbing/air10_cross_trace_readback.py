@@ -12,6 +12,7 @@ Enforces 7 Invariants (Zero Warnings, Zero Assert statements, Strict Exit 1 on A
 7. Exact field-for-field disk correlation with shim_intercept.log
 8. Durable presence of tool_traces_v2 summary record
 """
+from pathlib import Path
 import hashlib
 import json
 import os
@@ -19,10 +20,17 @@ import re
 import sqlite3
 import sys
 
-DB_PATH = "/Users/rajondas/.antigravity/air10_audit.db"
-SHIM_LOG = "/Users/rajondas/.antigravity/shim_intercept.log"
 
 EXPECTED_STAGES = ["INTENT", "ROUTER_EVALUATION", "SHIM_INTERCEPT", "PROCESS_EXECUTION", "INDEPENDENT_VERIFICATION"]
+
+
+def _default_db_path():
+    return str(Path.home() / ".antigravity" / "air10_audit.db")
+
+
+def _default_shim_log_path():
+    return str(Path.home() / ".antigravity" / "shim_intercept.log")
+
 
 def fatal_violation(msg):
     full_msg = f"❌ INVARIANT VIOLATION: {msg}"
@@ -30,8 +38,8 @@ def fatal_violation(msg):
     raise SystemExit(full_msg)
 
 def validate_and_readback(trace_id, db_path=None, shim_log=None):
-    active_db = db_path or DB_PATH
-    active_shim = shim_log or SHIM_LOG
+    active_db = db_path or _default_db_path()
+    active_shim = shim_log or _default_shim_log_path()
 
     if not os.path.exists(active_db):
         fatal_violation(f"Database not found at {active_db}")

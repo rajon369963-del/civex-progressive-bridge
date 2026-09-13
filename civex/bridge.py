@@ -222,7 +222,9 @@ class CIVeXVerifier:
                 if isinstance(state, dict):
                     if "failure_counts" not in state:
                         # Migrate legacy flat dict: {tool_id: count}
-                        migrated_fc = {k: v for k, v in state.items() if isinstance(v, int)}
+                        if any(type(v) is not int or v < 0 for v in state.values()):
+                            raise ValueError("Corrupt state: invalid legacy failure count")
+                        migrated_fc = dict(state)
                         state = {
                             "failure_counts": migrated_fc,
                             "execution_history": []
@@ -231,7 +233,13 @@ class CIVeXVerifier:
                         state.setdefault("failure_counts", {})
                         state.setdefault("execution_history", [])
                 else:
-                    state = {"failure_counts": {}, "execution_history": []}
+                    raise ValueError("Corrupt state: expected an object")
+
+                counts = state["failure_counts"]
+                if not isinstance(counts, dict) or any(type(v) is not int or v < 0 for v in counts.values()):
+                    raise ValueError("Corrupt state: invalid failure_counts")
+                if not isinstance(state["execution_history"], list):
+                    raise ValueError("Corrupt state: invalid execution_history")
 
                 yield state
                 temp_path = self.STATE_FILE + f".tmp.{os.getpid()}_{time.time_ns()}"
