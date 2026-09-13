@@ -1,9 +1,17 @@
 from pathlib import Path
+import hashlib
 import importlib.util
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFTEST = ROOT / "tests" / "conftest.py"
+
+# Independent frozen acceptance anchor for support-contract v1.  This digest is
+# intentionally not derived from either editable inventory below.  A coordinated
+# removal from both the runtime skip set and the local expected set must therefore
+# still go RED unless the support-contract version itself is deliberately revised.
+SUPPORT_CONTRACT_VERSION = "nonlinux-same-object-positive-courts-v1"
+FROZEN_COURT_SET_SHA256 = "826f189f78d045ef7acdd8ca7ba3e4571af05b19b976c4dd350334b007be8df4"
 
 EXPECTED_NONLINUX_POSITIVE_COURTS = frozenset(
     {
@@ -32,18 +40,27 @@ def _load_conftest_module():
     return module
 
 
+def _court_set_digest(names):
+    payload = "\n".join(sorted(names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def test_nonlinux_positive_court_inventory_is_frozen_and_real():
     """Explicit acceptance gate for the narrowed non-Linux SAME_OBJECT contract.
 
     Required CI may be green on non-Linux only when every intentionally unsupported
     positive child-execution court is named in this frozen inventory and every name
-    resolves to a real test. Adding/removing a skip silently must make this gate RED.
+    resolves to a real test.  Adding/removing a skip silently must make this gate RED.
     """
     conftest = _load_conftest_module()
     actual = conftest._NONLINUX_SAME_OBJECT_POSITIVE_TESTS
     assert actual == EXPECTED_NONLINUX_POSITIVE_COURTS, (
         "NONLINUX_SUPPORT_CONTRACT_DRIFT: skipped positive-court inventory changed "
         "without updating the explicit acceptance contract"
+    )
+    assert _court_set_digest(actual) == FROZEN_COURT_SET_SHA256, (
+        f"NONLINUX_SUPPORT_CONTRACT_AUTHORITY_DRIFT[{SUPPORT_CONTRACT_VERSION}]: "
+        "runtime and local inventories may not be co-edited around the frozen authority"
     )
 
     corpus = "\n".join(
