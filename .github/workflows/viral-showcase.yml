@@ -84,10 +84,15 @@ jobs:
           printf '\nVERIFIER_EXIT_CODE=%s\n' "$verifier_rc" | tee -a /tmp/civex_forensic_verification_report.txt
           exit "$verifier_rc"
 
+      - name: Run Directional Federation Lineage Freshness & Hostile Courts
+        shell: bash
+        run: |
+          python3 tests/test_federation_manifest_hostile_court.py
+
       - name: Verify Federation Evidence Manifest
         shell: bash
         run: |
-          python3 scripts/verify_federation_manifest.py --verify federation-evidence-manifest.json --repo civex-progressive-bridge
+          python3 scripts/verify_federation_manifest.py --verify federation-evidence-manifest.json --repo civex-progressive-bridge --authority-context auto --live-provider
 
       - name: Upload Forensic Verification Report
         if: always()
