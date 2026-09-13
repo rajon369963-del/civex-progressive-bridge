@@ -60,6 +60,101 @@ def get_git_output(cwd, cmd):
     except Exception:
         return "UNKNOWN"
 
+
+def classify_branch_lineage(cwd: Path, expected_head: str, actual_head: str) -> str:
+    """Classify branch/PR currentness direction relative to canonical HEAD."""
+    if actual_head == expected_head:
+        return "PASS_EXACT"
+
+    expected_is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", expected_head, actual_head],
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if expected_is_ancestor:
+        return "PASS_DESCENDANT"
+
+    actual_is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", actual_head, expected_head],
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if actual_is_ancestor:
+        return "STALE_ANCESTOR"
+
+    return "FAIL_UNRELATED"
+
+
+def resolve_authority_context(required_context: str | None) -> tuple[str, str, str, str, bool]:
+    """
+    Resolve active execution environment and verify against required authority context.
+    Returns (actual_mode, event, ref, ref_name, is_authorized).
+    """
+    event = os.environ.get("GITHUB_EVENT_NAME", "local")
+    ref = os.environ.get("GITHUB_REF", "")
+    ref_name = os.environ.get("GITHUB_REF_NAME", "")
+
+    # Determine actual execution environment
+    if event == "pull_request":
+        actual_mode = "pr"
+    elif event == "push" and (ref == "refs/heads/main" or ref_name == "main"):
+        actual_mode = "main"
+    elif event == "workflow_dispatch":
+        actual_mode = "manual"
+    elif ref.startswith("refs/heads/"):
+        actual_mode = "branch"
+    else:
+        actual_mode = "local"
+
+    # Verify against required authority
+    if not required_context or required_context == "auto":
+        is_authorized = True
+    elif required_context == "main":
+        is_authorized = (actual_mode == "main")
+    elif required_context == "branch":
+        is_authorized = (actual_mode in ("branch", "local", "pr"))
+    elif required_context == "pr":
+        is_authorized = (actual_mode == "pr")
+    else:
+        is_authorized = (actual_mode == required_context)
+
+    return actual_mode, event, ref, ref_name, is_authorized
+
+
+def verify_live_provider_head(repo: str, baseline_head: str, actual_head: str, cwd: Path, authority_mode: str = "auto") -> tuple[bool, str]:
+    """Verify remote provider main relative to baseline and runtime head."""
+    remote_url = f"https://github.com/rajon369963-del/{repo}.git"
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", remote_url, "refs/heads/main"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return False, f"Provider readback failed: {res.stderr.strip()}"
+        remote_sha = res.stdout.strip().split()[0]
+        lineage = classify_branch_lineage(cwd, baseline_head, remote_sha)
+        if lineage not in ("PASS_EXACT", "PASS_DESCENDANT"):
+            return False, f"Remote main {remote_sha[:10]} is invalid relative to baseline ({lineage})"
+
+        # Invariant for Main Authority Seal:
+        # If claiming MAIN authority (push to main or explicit main authority context),
+        # runtime HEAD MUST equal live provider main HEAD.
+        # Prevents hostile vector: baseline A -> local candidate B -> provider main C,
+        # where candidate B descends from baseline A but is behind current provider main C.
+        if authority_mode == "main":
+            if actual_head != remote_sha:
+                return False, f"Main authority mismatch: runtime HEAD {actual_head[:10]} != live provider main {remote_sha[:10]}"
+            return True, f"Live provider main exact match {remote_sha[:10]} (main authority confirmed)"
+
+        return True, f"Remote main {remote_sha[:10]} is valid baseline descendant ({lineage})"
+    except Exception as e:
+        return False, f"Provider network/API failure: {e}"
+
+
 def compute_canonical_payload(receipt_data: dict) -> tuple[bytes, str]:
     clean_copy = json.loads(json.dumps(receipt_data))
     if "provenance" in clean_copy:
@@ -86,7 +181,6 @@ def generate_manifest(manifest_path: Path):
         commit_sha = get_git_output(cwd, ["git", "rev-parse", "HEAD"])
         tree_sha = get_git_output(cwd, ["git", "rev-parse", "HEAD^{tree}"])
 
-        # Fail closed on branch protection: default to False on failure
         enforce_admins = False
         required_checks = []
         try:
@@ -107,10 +201,8 @@ def generate_manifest(manifest_path: Path):
         provenance = receipt_data.get("provenance", {})
         receipt_sig = provenance.get("signature_ed25519_hex", "")
         attested_payload_sha = provenance.get("canonical_payload_sha256", "")
-        
         _, recomputed_payload_sha = compute_canonical_payload(receipt_data)
 
-        # Fail closed on Pages: default to 0 on failure
         pages_url = PAGES_URLS[repo]
         pages_code = 0
         try:
@@ -146,7 +238,7 @@ def generate_manifest(manifest_path: Path):
         json.dump(manifest, f, indent=2)
     print(f"Generated federation manifest at {manifest_path}")
 
-def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
+def verify_manifest(manifest_path: Path, target_repo: str = None, authority_context: str = "auto", live_provider: bool = False) -> bool:
     print(f"Verifying Federation Evidence Manifest: {manifest_path}")
     if not manifest_path.exists():
         print(f"FAIL: Manifest file does not exist: {manifest_path}")
@@ -177,8 +269,6 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
             continue
 
         print(f"--- Checking Repo: {repo} ---")
-        
-        # Determine repo directory
         cwd = None
         if (Path.cwd() / "db" / "STRESS_BENCHMARK_REAL_WHEELS.json").exists() and Path.cwd().name == repo:
             cwd = Path.cwd()
@@ -186,43 +276,45 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
             cwd = REPO_ROOTS[repo]
 
         if cwd and cwd.exists():
-            # 1. HARD ASSERTION: Local HEAD must match manifest canonical_main_sha or descend from it
             actual_head = get_git_output(cwd, ["git", "rev-parse", "HEAD"])
-            expected_head = rdata["canonical_main_sha"]
-            current_branch = get_git_output(cwd, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
-            is_main_context = current_branch in ["main", "master"] and os.environ.get("GITHUB_EVENT_NAME") != "pull_request"
+            baseline_head = rdata["canonical_main_sha"]
+            baseline_tree = rdata.get("canonical_main_tree_sha", "")
 
-            if is_main_context:
-                if actual_head != expected_head:
-                    print(f"FAIL: Main HEAD mismatch: expected {expected_head}, got {actual_head}")
-                    all_passed = False
-                else:
-                    print(f"  • Canonical Main HEAD Match: [PASS] ({actual_head[:10]})")
-
+            lineage = classify_branch_lineage(cwd, baseline_head, actual_head)
+            if lineage == "PASS_EXACT":
+                print(f"  • Baseline HEAD Match       : [PASS] (Exact match {actual_head[:10]})")
                 actual_tree = get_git_output(cwd, ["git", "rev-parse", "HEAD^{tree}"])
-                expected_tree = rdata["canonical_main_tree_sha"]
-                if actual_tree != expected_tree:
-                    print(f"FAIL: Main Tree mismatch: expected {expected_tree}, got {actual_tree}")
+                if actual_tree != baseline_tree:
+                    print(f"FAIL: Baseline Tree mismatch: expected {baseline_tree}, got {actual_tree}")
                     all_passed = False
                 else:
-                    print(f"  • Canonical Main Tree Match: [PASS] ({actual_tree[:10]})")
+                    print(f"  • Baseline Tree Match       : [PASS] ({actual_tree[:10]})")
+            elif lineage == "PASS_DESCENDANT":
+                print(f"  • Lineage Provenance Check : [PASS] (Descends from baseline {baseline_head[:10]})")
+            elif lineage == "STALE_ANCESTOR":
+                print(f"FAIL: Stale HEAD {actual_head[:10]} is an ancestor of baseline {baseline_head[:10]}")
+                all_passed = False
             else:
-                # PR or branch context: verify lineage
-                if actual_head == expected_head:
-                    print(f"  • Branch HEAD Match        : [PASS] (Exact match {actual_head[:10]})")
-                else:
-                    is_ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", expected_head, actual_head], cwd=cwd).returncode == 0
-                    if not is_ancestor:
-                        is_descendant = subprocess.run(["git", "merge-base", "--is-ancestor", actual_head, expected_head], cwd=cwd).returncode == 0
-                        if not is_descendant:
-                            print(f"FAIL: Lineage broken between {actual_head[:10]} and canonical {expected_head[:10]}")
-                            all_passed = False
-                        else:
-                            print(f"  • Lineage Ancestry Verified: [PASS] (Head {actual_head[:10]} is ancestor of {expected_head[:10]})")
-                    else:
-                        print(f"  • Lineage Provenance Check : [PASS] (Descends from {expected_head[:10]})")
+                print(f"FAIL: Lineage broken between HEAD {actual_head[:10]} and baseline {baseline_head[:10]}")
+                all_passed = False
 
-            # 2. Check Ed25519 signature of canonical payload
+            # Authority Context Binding (Quant Issue #56)
+            mode, event, ref, ref_name, is_authorized = resolve_authority_context(authority_context)
+            if not is_authorized:
+                print(f"FAIL: Authority Context Mismatch: required '{authority_context}', but executing under mode '{mode}' (event={event}, ref={ref})")
+                all_passed = False
+            else:
+                print(f"  • Authority Binding Check  : [PASS] CHECK_NAME={repo} HEAD_SHA={actual_head[:10]} CONTEXT={mode} EVENT={event or 'local'} REF={ref or 'local'} DECISION={'PASS' if all_passed else 'FAIL'}")
+
+            # Optional Live Provider Readback
+            if live_provider:
+                ok, msg = verify_live_provider_head(repo, baseline_head, actual_head, cwd, authority_mode=mode)
+                if not ok:
+                    print(f"FAIL: Live Provider Verification: {msg}")
+                    all_passed = False
+                else:
+                    print(f"  • Live Provider Readback   : [PASS] {msg}")
+
             receipt_path = cwd / rdata["receipt"]["path"]
             if receipt_path.exists():
                 receipt_obj = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -245,7 +337,6 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
                 print(f"FAIL: Receipt not found at {receipt_path}")
                 all_passed = False
 
-            # 3. Check commit reachability
             attested_commit = rdata["receipt"]["attested_source_commit"]
             res = subprocess.run(["git", "cat-file", "-e", f"{attested_commit}^{{commit}}"], cwd=cwd, capture_output=True)
             if res.returncode != 0:
@@ -254,7 +345,6 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
             else:
                 print(f"  • Attested Commit Reachable: [PASS] ({attested_commit[:10]})")
 
-            # 4. Check tree match
             expected_receipt_tree = rdata["receipt"]["attested_source_tree"]
             actual_receipt_tree = get_git_output(cwd, ["git", "rev-parse", f"{attested_commit}^{{tree}}"])
             if actual_receipt_tree != expected_receipt_tree:
@@ -263,7 +353,6 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
             else:
                 print("  • Attested Tree SHA Exact  : [PASS]")
 
-            # 5. Physical execution of 5 adversarial canaries (Fail closed)
             canary_script = cwd / "tests" / "test_adversarial_receipt_canaries.py"
             if canary_script.exists():
                 canary_proc = subprocess.run([sys.executable, str(canary_script)], cwd=cwd, capture_output=True)
@@ -280,14 +369,12 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
             print(f"FAIL: Local repo not found at {cwd}")
             all_passed = False
 
-        # 6. Check Branch Protection enforce_admins
         if not rdata.get("branch_protection_enforce_admins"):
             print(f"FAIL: Branch protection enforce_admins is not True for {repo}")
             all_passed = False
         else:
             print("  • Branch Protection Admins : [PASS] (enforce_admins=True)")
 
-        # 7. Check Required Checks non-empty
         req_checks = rdata.get("required_branch_contexts", [])
         if not req_checks:
             print(f"FAIL: No required status checks configured for {repo}")
@@ -295,7 +382,6 @@ def verify_manifest(manifest_path: Path, target_repo: str = None) -> bool:
         else:
             print(f"  • Required Status Checks   : [PASS] ({', '.join(req_checks)})")
 
-        # 8. Check Pages
         if rdata["pages"]["status_code"] != 200:
             print(f"FAIL: Pages endpoint returned {rdata['pages']['status_code']}")
             all_passed = False
@@ -315,12 +401,14 @@ def main():
     parser.add_argument("--generate", type=Path, help="Generate manifest to file")
     parser.add_argument("--verify", type=Path, help="Verify manifest file")
     parser.add_argument("--repo", type=str, default=None, help="Specific repository to verify")
+    parser.add_argument("--authority-context", type=str, default="auto", choices=["auto", "main", "branch", "pr", "manual", "local"], help="Authority context to enforce")
+    parser.add_argument("--live-provider", action="store_true", help="Perform live provider readback verification")
     args = parser.parse_args()
 
     if args.generate:
         generate_manifest(args.generate)
     if args.verify:
-        ok = verify_manifest(args.verify, target_repo=args.repo)
+        ok = verify_manifest(args.verify, target_repo=args.repo, authority_context=args.authority_context, live_provider=args.live_provider)
         sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
