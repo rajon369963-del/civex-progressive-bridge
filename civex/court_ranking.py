@@ -144,7 +144,11 @@ PRIMARY_TOOL_SUBSTITUTIONS: dict[str, str] = {
 }
 
 
-COURT_SECRET_KEY = os.environ.get("AIR10_COURT_SECRET_KEY", "air10_sovereign_court_master_secret_v9")
+def _authority_key(secret_key=None):
+    key = secret_key or os.environ.get("AIR10_COURT_SECRET_KEY")
+    if not key:
+        raise ValueError("COURT_AUTHORITY_KEY_UNAVAILABLE_HOLD")
+    return key.encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -189,7 +193,7 @@ class CourtExecutionPermit:
         expires_at = (now + timedelta(seconds=ttl_sec)).isoformat()
         permit_id = f"permit_{uuid.uuid4().hex[:12]}"
         nonce = uuid.uuid4().hex[:8]
-        key = (secret_key or COURT_SECRET_KEY).encode("utf-8")
+        key = _authority_key(secret_key)
         raw = (
             f"{permit_id}|{tool_name}|{capability}|{input_format}|"
             f"{contract_version}|{binary_path}|{approved_sha}|ELIGIBLE|"
@@ -244,7 +248,10 @@ def verify_permit(
     if not permit.signature:
         return False, "PERMIT_SIGNATURE_MISSING: Permit contains no cryptographic signature"
 
-    key = (secret_key or COURT_SECRET_KEY).encode("utf-8")
+    try:
+        key = _authority_key(secret_key)
+    except ValueError as exc:
+        return False, str(exc)
     expected_sig = hmac.new(key, permit.canonical_bytes(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(permit.signature, expected_sig):
         return False, "PERMIT_SIGNATURE_FORGED: Cryptographic signature mismatch (tampered or forged permit)"
