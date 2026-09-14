@@ -11,7 +11,7 @@ CONFTEST = ROOT / "tests" / "conftest.py"
 # removal from both the runtime skip set and the local expected set must therefore
 # still go RED unless the support-contract version itself is deliberately revised.
 SUPPORT_CONTRACT_VERSION = "nonlinux-same-object-positive-courts-v1"
-FROZEN_COURT_SET_SHA256 = "826f189f78d045ef7acdd8ca7ba3e4571af05b19b976c4dd350334b007be8df4"
+FROZEN_COURT_SET_SHA256 = "b99a03e2cde2d110f99dc7adeecfcb4d29ff90a27bf8bc515cdefe9757153257"
 
 EXPECTED_NONLINUX_POSITIVE_COURTS = frozenset(
     {
@@ -28,6 +28,7 @@ EXPECTED_NONLINUX_POSITIVE_COURTS = frozenset(
         "test_gate28_permit_authenticity_and_sha_bypass_rejection",
         "test_gate29_snapshot_aba_and_inode_binding",
         "test_gate30_timeout_process_group_termination_and_orphan_check",
+        "test_nonlinux_positive_court_inventory_is_frozen_and_real",
     }
 )
 
