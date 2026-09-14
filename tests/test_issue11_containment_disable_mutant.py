@@ -3,6 +3,7 @@
 This file is intentionally hosted only on a disposable mutant branch/PR. It monkeypatches
 the production containment primitive to a no-op and reuses the exact frozen real-path
 Issue11 oracle. A green result would be a FALSE_GREEN in the repair's mutation sensitivity.
+The mutant is expected to fail on the hosted production-shaped path; never merge it.
 """
 
 from civex.trace_plumbing import air10_layer4_executor
