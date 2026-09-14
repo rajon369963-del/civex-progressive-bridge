@@ -49,6 +49,70 @@ class ExecutionTimeoutError(PostExecutionOutcomeUnknown, subprocess.TimeoutExpir
         return self.args[0]
 
 
+def _snapshot_descendants(root_pid):
+    """Return current POSIX descendants as {pid: pgid} using the native ps surface."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    children = {}
+    pgids = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, ppid, pgid = map(int, fields)
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        pgids[pid] = pgid
+
+    descendants = {}
+    pending = list(children.get(root_pid, ()))
+    seen = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if pid in pgids:
+            descendants[pid] = pgids[pid]
+        pending.extend(children.get(pid, ()))
+    return descendants
+
+
+def _signal_detached_descendants(root_pid, root_pgid, sig):
+    """Signal descendants that escaped the supervisor process group; return attempted PIDs."""
+    escaped = []
+    for pid, snapshot_pgid in _snapshot_descendants(root_pid).items():
+        if snapshot_pgid == root_pgid:
+            continue
+        try:
+            # Re-check the process-group identity immediately before signalling to reduce
+            # the chance that a recycled PID is mistaken for the snapshotted descendant.
+            if os.getpgid(pid) != snapshot_pgid:
+                continue
+            os.kill(pid, sig)
+            escaped.append(pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # Fail-closed semantics are preserved by the detached-survivor court: an
+            # unkillable survivor remains observable and keeps the repair RED.
+            escaped.append(pid)
+    return escaped
+
+
 def execute_process(
     trace_id,
     binary_path=None,
@@ -154,7 +218,7 @@ def execute_process(
     if require_court_sha:
         if permit is None:
             raise RuntimeError(f"COURT_PERMIT_REQUIRED_HOLD COURT_ATTESTATION_MISSING_HOLD: Mandatory CourtExecutionPermit missing for binary '{binary_path}'")
-        
+
         try:
             from civex.court_ranking import verify_permit
         except Exception:
@@ -205,7 +269,9 @@ def execute_process(
     if expected_input_sha:
         env["AIR10_EXPECTED_INPUT_SHA"] = expected_input_sha
 
-    # Process-Group Isolated Execution: Ensures entire process tree is terminated on timeout
+    # Process-group isolation remains the primary timeout boundary. A detached setsid()
+    # descendant is outside that group, so the timeout path also snapshots and terminates
+    # escaped descendants through the native POSIX process table before group teardown.
     proc = subprocess.Popen(
         [supervisor_bin, trace_id, effective_parent or "root", binary_path] + cmd_args,
         stdout=subprocess.PIPE,
@@ -218,6 +284,13 @@ def execute_process(
         proc_stdout, proc_stderr = proc.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired as te:
         pgid = os.getpgid(proc.pid)
+
+        # Kill escaped sessions first while the supervisor ancestry is still intact; this
+        # closes the deterministic setsid() escape without replacing the existing group court.
+        detached_term = _signal_detached_descendants(proc.pid, pgid, signal.SIGTERM)
+        time.sleep(0.05)
+        detached_kill = _signal_detached_descendants(proc.pid, pgid, signal.SIGKILL)
+
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
@@ -230,7 +303,11 @@ def execute_process(
             except ProcessLookupError:
                 pass
             proc.wait(timeout=1.0)
-        err_msg = f"EXECUTION_TIMEOUT_HOLD: Process group {pgid} terminated after exceeding deadline of {timeout_sec}s"
+        escaped_count = len(set(detached_term + detached_kill))
+        err_msg = (
+            f"EXECUTION_TIMEOUT_HOLD: Process group {pgid} terminated after exceeding "
+            f"deadline of {timeout_sec}s; detached_descendants_signalled={escaped_count}"
+        )
         sys.stderr.write(f"{err_msg}\n")
         raise ExecutionTimeoutError(err_msg) from te
 
