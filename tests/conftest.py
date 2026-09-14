@@ -24,7 +24,6 @@ _NONLINUX_SAME_OBJECT_POSITIVE_TESTS = frozenset(
         "test_gate27_randomized_concurrent_stress_loop",
         "test_gate28_permit_authenticity_and_sha_bypass_rejection",
         "test_gate29_snapshot_aba_and_inode_binding",
-        "test_gate30_timeout_process_group_termination_and_orphan_check",
     }
 )
 
