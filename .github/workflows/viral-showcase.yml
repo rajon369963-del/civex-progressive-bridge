@@ -45,6 +45,15 @@ jobs:
         shell: bash
         run: |
           node tests/test_browser_bm25_execution.mjs
+      - name: Verify Hosted Zero-Install Demo Semantic Identity
+        shell: bash
+        run: |
+          python3 scripts/verify_public_demo_identity.py \
+            --url "https://rajon369963-del.github.io/civex-progressive-bridge/" \
+            --source index.html \
+            --marker "CIVEX CANONICAL OKAPI BM25 ROUTER" \
+            --marker "executeRealRouting" \
+            --marker "tool_git_commit_and_push"
       - name: Execute Standalone Okapi BM25 Benchmark Reproducer
         shell: bash
         run: |
