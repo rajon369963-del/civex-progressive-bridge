@@ -6,12 +6,12 @@ import importlib.util
 ROOT = Path(__file__).resolve().parents[1]
 CONFTEST = ROOT / "tests" / "conftest.py"
 
-# Independent frozen acceptance anchor for support-contract v1.  This digest is
-# intentionally not derived from either editable inventory below.  A coordinated
-# removal from both the runtime skip set and the local expected set must therefore
-# still go RED unless the support-contract version itself is deliberately revised.
-SUPPORT_CONTRACT_VERSION = "nonlinux-same-object-positive-courts-v1"
-FROZEN_COURT_SET_SHA256 = "826f189f78d045ef7acdd8ca7ba3e4571af05b19b976c4dd350334b007be8df4"
+# Diagnostic coordinated co-edit mutant for Issue #53.  This deliberately changes
+# the candidate-controlled expected inventory and its local digest together with
+# the runtime skip inventory.  If the current v1 court still passes, the supposed
+# frozen authority is self-authorizable by the candidate revision.
+SUPPORT_CONTRACT_VERSION = "nonlinux-same-object-positive-courts-v2-mutant"
+FROZEN_COURT_SET_SHA256 = "b46933ffbe13736aa25796a7138af7bc0860ea4354077f36c64cabde6aa59f5b"
 
 EXPECTED_NONLINUX_POSITIVE_COURTS = frozenset(
     {
@@ -27,7 +27,6 @@ EXPECTED_NONLINUX_POSITIVE_COURTS = frozenset(
         "test_gate27_randomized_concurrent_stress_loop",
         "test_gate28_permit_authenticity_and_sha_bypass_rejection",
         "test_gate29_snapshot_aba_and_inode_binding",
-        "test_gate30_timeout_process_group_termination_and_orphan_check",
     }
 )
 
@@ -46,12 +45,7 @@ def _court_set_digest(names):
 
 
 def test_nonlinux_positive_court_inventory_is_frozen_and_real():
-    """Explicit acceptance gate for the narrowed non-Linux SAME_OBJECT contract.
-
-    Required CI may be green on non-Linux only when every intentionally unsupported
-    positive child-execution court is named in this frozen inventory and every name
-    resolves to a real test.  Adding/removing a skip silently must make this gate RED.
-    """
+    """Explicit acceptance gate for the narrowed non-Linux SAME_OBJECT contract."""
     conftest = _load_conftest_module()
     actual = conftest._NONLINUX_SAME_OBJECT_POSITIVE_TESTS
     assert actual == EXPECTED_NONLINUX_POSITIVE_COURTS, (
