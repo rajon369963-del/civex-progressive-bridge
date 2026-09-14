@@ -409,7 +409,7 @@ def execute_process(
     payload_raw = json.dumps(details, sort_keys=True).encode("utf-8")
     payload_sha256 = hashlib.sha256(payload_raw).hexdigest()
 
-    active_db = db_path or DB_PATH
+    active_db = db_path or audit_db or DB_PATH
     if os.path.exists(active_db):
         conn = sqlite3.connect(active_db)
         cur = conn.cursor()
