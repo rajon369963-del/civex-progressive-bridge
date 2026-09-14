@@ -15,6 +15,9 @@ AUTHORIZED_AUTHORITIES = {
 }
 
 
+RECOGNIZED_TIERS = {"standard", "gold", "enterprise_gold", "sovereign"}
+
+
 def compute_contract_digest(contract_data: dict[str, Any]) -> str:
     """
     Computes a canonical SHA-256 digest over the contract's immutable fields,
@@ -36,7 +39,8 @@ def compute_contract_digest(contract_data: dict[str, Any]) -> str:
 
 def verify_contract_authority(
     contract_data: dict[str, Any],
-    authorized_signers: set[str] = AUTHORIZED_AUTHORITIES
+    authorized_signers: set[str] = AUTHORIZED_AUTHORITIES,
+    recognized_tiers: set[str] = RECOGNIZED_TIERS
 ) -> tuple[bool, list[str]]:
     """
     Fail-closed verification: asserts that a support contract is signed by an
@@ -57,6 +61,16 @@ def verify_contract_authority(
     if errors:
         return False, errors
 
+    # Check contract_id
+    contract_id = contract_data.get("contract_id")
+    if not isinstance(contract_id, str) or not contract_id.strip():
+        errors.append(f"Invalid contract_id: '{contract_id}' (must be non-empty string)")
+
+    # Check tier
+    tier = contract_data.get("tier")
+    if not isinstance(tier, str) or tier.lower() not in recognized_tiers:
+        errors.append(f"Invalid tier: '{tier}' (must be one of {sorted(recognized_tiers)})")
+
     # Check authorized signer
     signer = contract_data.get("signer")
     if signer not in authorized_signers:
@@ -66,6 +80,7 @@ def verify_contract_authority(
     sla_ms = contract_data.get("sla_ms")
     if not isinstance(sla_ms, (int, float)) or sla_ms <= 0:
         errors.append(f"Invalid sla_ms: {sla_ms}")
+
 
     # Check digest format
     digest = contract_data.get("digest", "")

@@ -73,6 +73,31 @@ class TestT021Negative(unittest.TestCase):
         self.assertFalse(valid, "Negative SLA must be rejected")
         self.assertTrue(any("Invalid sla_ms" in e for e in errors))
 
+    def test_mutant_empty_contract_id(self):
+        contract = {
+            "contract_id": "   ",
+            "tier": "gold",
+            "sla_ms": 50,
+            "signer": "CIVEX_ROOT_AUTHORITY_2026",
+        }
+        contract["digest"] = compute_contract_digest(contract)
+        valid, errors = verify_contract_authority(contract)
+        self.assertFalse(valid, "Empty contract_id must be rejected")
+        self.assertTrue(any("Invalid contract_id" in e for e in errors))
+
+    def test_mutant_invalid_tier(self):
+        contract = {
+            "contract_id": "CIVEX-SAMPLE-003",
+            "tier": "unauthorized_diamond_tier",
+            "sla_ms": 50,
+            "signer": "CIVEX_ROOT_AUTHORITY_2026",
+        }
+        contract["digest"] = compute_contract_digest(contract)
+        valid, errors = verify_contract_authority(contract)
+        self.assertFalse(valid, "Invalid tier must be rejected")
+        self.assertTrue(any("Invalid tier" in e for e in errors))
+
 
 if __name__ == "__main__":
     unittest.main()
+
