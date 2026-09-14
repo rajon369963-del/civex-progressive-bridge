@@ -71,7 +71,7 @@ def orchestrate_request(
                 "error": f"Router found no verified, eligible tool on attempt {attempt}",
             }
 
-        cmd_args = argv or [input_file]
+        cmd_args = [input_file] if argv is None else list(argv)
         span_shim_id = air10_layer3_shim.shim_intercept(
             trace_id=trace_id,
             tool_name=chosen_tool,
