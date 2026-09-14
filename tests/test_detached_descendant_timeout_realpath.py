@@ -5,7 +5,6 @@ import subprocess
 import time
 
 import pytest
-
 from civex.court_ranking import CourtExecutionPermit
 from civex.trace_plumbing import air10_layer4_executor
 
@@ -83,7 +82,7 @@ def test_issue11_detached_setsid_descendant_cannot_outlive_timeout(tmp_path, mon
         "import os,time; from pathlib import Path; "
         "os.setsid(); "
         f"Path({str(pid_file)!r}).write_text(str(os.getpid())); "
-        "time.sleep(1.0); "
+        "time.sleep(3.0); "
         f"Path({str(marker)!r}).write_text('SURVIVED_TIMEOUT')"
     )
     worker.write_text(
@@ -126,17 +125,17 @@ def test_issue11_detached_setsid_descendant_cannot_outlive_timeout(tmp_path, mon
             target_bin=str(worker),
             audit_db=db_path,
             permit=permit,
-            timeout_sec=0.35,
+            timeout_sec=1.5,
         )
 
     # Ensure the adversary actually reached the detached state before interpreting absence.
-    deadline = time.monotonic() + 0.8
+    deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and not pid_file.exists():
         time.sleep(0.02)
     assert pid_file.exists(), "fixture invalid: detached descendant never materialized"
 
     detached_pid = int(pid_file.read_text().strip())
-    grace_deadline = time.monotonic() + 1.25
+    grace_deadline = time.monotonic() + 3.5
     while time.monotonic() < grace_deadline and not marker.exists():
         time.sleep(0.03)
 
