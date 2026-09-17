@@ -140,13 +140,18 @@ class GuruShishyaLifecycleInterceptor:
         }
         turn_text = f"Tool Execution [{tool_name}] (code={returncode}, {latency_ms:.1f}ms): {output_summary[:300]}"
         
-        # If execution had an error or critical effect, record an episodic memory
+        # If execution had an error or critical effect, record an episodic memory & cognitive error
         if returncode != 0:
             self.record_episodic(
                 content=f"Tool failure in {tool_name}: {output_summary[:200]}",
                 category="TOOL_ERROR",
                 importance=1.2,
                 async_write=async_write
+            )
+            self.record_cognitive_error(
+                topic=tool_name,
+                misconception=f"Process exited with non-zero code {returncode}",
+                trap=output_summary[:300]
             )
 
         return self.after_turn(
@@ -165,6 +170,7 @@ class GuruShishyaLifecycleInterceptor:
         emotional_tone: str = "NEUTRAL",
         importance: float = 1.0,
         conversation_id: str = "",
+        memory_id: Optional[str] = None,
         async_write: bool = True
     ) -> str:
         """Records an atomic episodic memory."""
@@ -174,7 +180,8 @@ class GuruShishyaLifecycleInterceptor:
                 category=category,
                 emotional_tone=emotional_tone,
                 importance=importance,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                memory_id=memory_id
             )
             return "ASYNC_ENQUEUED"
         else:
@@ -183,16 +190,37 @@ class GuruShishyaLifecycleInterceptor:
                 category=category,
                 emotional_tone=emotional_tone,
                 importance=importance,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                memory_id=memory_id
             )
 
     def search_memories(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Sub-20ms FTS5 BM25 search."""
         return self.engine.search_memories(query=query, limit=limit)
 
+    def get_memory(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single memory record by exact ID."""
+        return self.engine.get_memory(memory_id)
+
+    def delete_memory(self, memory_id: str) -> bool:
+        """Deletes an episodic memory by ID."""
+        return self.engine.delete_memory(memory_id)
+
+    def list_keys(self, prefix: Optional[str] = None) -> List[str]:
+        """Lists stored memory IDs."""
+        return self.engine.list_keys(prefix=prefix)
+
+    def clear_memories(self) -> None:
+        """Clears all episodic memories."""
+        self.engine.clear_memories()
+
     def update_profile_fact(self, key: str, value: str, category: str = "PREFERENCE") -> None:
         """Updates durable profile facts."""
         self.engine.update_profile_fact(key=key, value=value, category=category)
+
+    def record_cognitive_error(self, topic: str, misconception: str, trap: str) -> str:
+        """Records a cognitive error in Tier 5 error ledger."""
+        return self.engine.record_cognitive_error(topic=topic, misconception=misconception, trap=trap)
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns SQLite WAL row counts and memory health stats."""
@@ -201,3 +229,4 @@ class GuruShishyaLifecycleInterceptor:
     def flush(self) -> None:
         """Flushes background write queue."""
         self.engine.flush()
+

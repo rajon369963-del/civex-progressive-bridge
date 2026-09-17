@@ -747,6 +747,12 @@ def main(argv: list[str] | None = None) -> int:
     # memory-drain (Drain background writeback queue)
     subparsers.add_parser("memory-drain", help="Flush background write queue")
 
+    # memory-error (Record cognitive error or trap)
+    err_m = subparsers.add_parser("memory-error", help="Record cognitive error or misconception")
+    err_m.add_argument("topic", help="Topic or tool name")
+    err_m.add_argument("misconception", help="Misconception summary")
+    err_m.add_argument("trap", help="Underlying trap or failure reason")
+
     args = parser.parse_args(argv)
 
     try:
@@ -831,13 +837,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif args.command == "memory-hydrate":
         from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
-        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
         block = interceptor.before_turn(args.query, session_id="civex_cli", limit=args.limit)
         print(block)
         return 0
     elif args.command == "memory-record":
         from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
-        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
         res = interceptor.record_episodic(
             content=args.content,
             category=args.category,
@@ -851,21 +857,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif args.command == "memory-search":
         from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
-        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
         results = interceptor.search_memories(args.query, limit=args.limit)
         print(json.dumps(results, indent=2))
         return 0
     elif args.command == "memory-stats":
         from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
-        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
         stats = interceptor.get_stats()
         print(json.dumps(stats, indent=2))
         return 0
     elif args.command == "memory-drain":
         from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
-        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
         interceptor.flush()
         print(json.dumps({"status": "DRAINED"}))
+        return 0
+    elif args.command == "memory-error":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor.get_instance(db_path=args.db_path)
+        err_id = interceptor.record_cognitive_error(args.topic, args.misconception, args.trap)
+        print(json.dumps({"status": "RECORDED", "error_id": err_id}))
         return 0
 
     return 0
