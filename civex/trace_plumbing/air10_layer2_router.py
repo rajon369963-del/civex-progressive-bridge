@@ -36,36 +36,53 @@ def route_intent(trace_id, parent_span_id, intent_query, required_capability="JS
         except Exception:
             ranker = None
 
-    # 1. Run physical air10-auto-trigger or use override
+    # 1. Zero-Fork In-Process Dispatch (§3) with CLI and heuristic fallback
     trigger_cmd = os.environ.get("AIR10_AUTO_TRIGGER_BIN", "/Users/rajondas/.local/bin/air10-auto-trigger")
     candidates = []
     if candidates_override is not None:
         candidates = list(candidates_override)
-    elif os.path.isfile(trigger_cmd) and os.access(trigger_cmd, os.X_OK):
-        res = subprocess.run([trigger_cmd, intent_query], capture_output=True, text=True)
-        lines = res.stdout.splitlines()
-        current_cand = None
-        for line in lines:
-            if line.startswith("[") and "] " in line:
-                parts = line.split("] ")
-                cand_name = parts[1].split(" | ")[0].strip()
-                current_cand = {"name": cand_name, "raw_header": line.strip()}
-                candidates.append(current_cand)
-            elif current_cand and "Binary" in line and ":" in line:
-                current_cand["binary"] = line.split(":", 1)[1].strip()
-            elif current_cand and "Command" in line and ":" in line:
-                current_cand["command"] = line.split(":", 1)[1].strip()
     else:
-        # Default candidate pool based on intent
-        if "json" in intent_query.lower():
-            candidates = [
-                {"name": "air10-fast-json", "binary": "/Users/rajondas/.local/bin/air10-fast-json"},
-                {"name": "air10-orjson-tool", "binary": "/Users/rajondas/.local/bin/air10-orjson-tool"}
-            ]
-        else:
-            candidates = [
-                {"name": "git-commit-helper", "binary": "/usr/bin/git"}
-            ]
+        # Zero-fork in-process dispatch via air1_trigger (<200us)
+        try:
+            import air1_trigger
+            res_dict = air1_trigger.run(intent_query, limit=5, return_dict=True)
+            if res_dict and res_dict.get("status") == "MATCH_FOUND" and res_dict.get("name"):
+                candidates.append({
+                    "name": res_dict["name"],
+                    "binary": res_dict.get("binary_path") or f"/Users/rajondas/.local/bin/{res_dict['name']}",
+                    "raw_header": f"[1] {res_dict['name']} | score 1.0",
+                    "command": res_dict.get("resolved_cmd")
+                })
+        except Exception:
+            pass
+
+        # Fallback to physical air10-auto-trigger binary if in-process yielded no candidates
+        if not candidates and os.path.isfile(trigger_cmd) and os.access(trigger_cmd, os.X_OK):
+            res = subprocess.run([trigger_cmd, intent_query], capture_output=True, text=True)
+            lines = res.stdout.splitlines()
+            current_cand = None
+            for line in lines:
+                if line.startswith("[") and "] " in line:
+                    parts = line.split("] ")
+                    cand_name = parts[1].split(" | ")[0].strip()
+                    current_cand = {"name": cand_name, "raw_header": line.strip()}
+                    candidates.append(current_cand)
+                elif current_cand and "Binary" in line and ":" in line:
+                    current_cand["binary"] = line.split(":", 1)[1].strip()
+                elif current_cand and "Command" in line and ":" in line:
+                    current_cand["command"] = line.split(":", 1)[1].strip()
+
+        # Default fallback candidate pool based on intent if still no candidates
+        if not candidates:
+            if "json" in intent_query.lower():
+                candidates = [
+                    {"name": "air10-fast-json", "binary": "/Users/rajondas/.local/bin/air10-fast-json"},
+                    {"name": "air10-orjson-tool", "binary": "/Users/rajondas/.local/bin/air10-orjson-tool"}
+                ]
+            else:
+                candidates = [
+                    {"name": "git-commit-helper", "binary": "/usr/bin/git"}
+                ]
 
     # 2. Evaluate candidate tools via CourtAwareRanker
     evaluations = []

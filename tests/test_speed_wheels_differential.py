@@ -87,8 +87,31 @@ def test_sqlite3_wal_auto_upgrade():
         if os.path.exists(db_path):
             os.remove(db_path)
 
+from hypothesis import given, settings, strategies as st
+
+# Recursive strategy for arbitrary valid JSON structures
+_json_primitives = st.none() | st.booleans() | st.integers(min_value=-10**15, max_value=10**15) | st.floats(allow_nan=False, allow_infinity=False, allow_subnormal=False) | st.text(max_size=50)
+_json_strategy = st.recursive(
+    _json_primitives,
+    lambda children: st.lists(children, max_size=5) | st.dictionaries(st.text(max_size=20), children, max_size=5),
+    max_leaves=15
+)
+
+@settings(max_examples=100, deadline=None)
+@given(val=_json_strategy)
+def test_hypothesis_differential_fuzzing(val):
+    """Fuzz accelerated json.dumps vs stdlib json._orig_dumps across 100 random JSON structures."""
+    fast_dump = json.dumps(val)
+    orig_dump = json._orig_dumps(val)
+    assert isinstance(fast_dump, str)
+    assert isinstance(orig_dump, str)
+    # Roundtrip semantic parity
+    fast_loaded = json.loads(fast_dump)
+    orig_loaded = json._orig_loads(orig_dump)
+    assert fast_loaded == orig_loaded
+
 def test_sqlite3_concurrency_stress():
-    """Verify 10 concurrent threads can write to SQLite WAL without 'database is locked'."""
+    """Verify 10 concurrent threads can write to SQLite WAL without 'database is locked' (500 writes)."""
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tf:
         db_path = tf.name
 
@@ -103,7 +126,7 @@ def test_sqlite3_concurrency_stress():
         def worker(thread_idx):
             try:
                 conn = sqlite3.connect(db_path)
-                for i in range(25):
+                for i in range(50):
                     conn.execute("INSERT INTO records (thread_id, val) VALUES (?, ?);", (thread_idx, f"thread_{thread_idx}_{i}"))
                     conn.commit()
                 conn.close()
@@ -123,7 +146,7 @@ def test_sqlite3_concurrency_stress():
         cur = check_conn.cursor()
         cur.execute("SELECT COUNT(*) FROM records;")
         count = cur.fetchone()[0]
-        assert count == 250, f"Expected 250 records, found {count}"
+        assert count == 500, f"Expected 500 records, found {count}"
         check_conn.close()
     finally:
         if os.path.exists(db_path):
@@ -147,11 +170,13 @@ def test_kill_switch_behavior():
     assert "False False False" in stdout
 
 def test_ast_guard_detection():
-    """Verify air1_ast_guard.py accurately detects banned patterns."""
+    """Verify air1_ast_guard.py accurately detects banned patterns and warnings."""
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tf:
         tf.write("""
 import json
 import glob
+import pickle
+import urllib.request
 import subprocess
 
 def bad_func():
@@ -161,11 +186,20 @@ def bad_func():
 
     try:
         guard_bin = "/Users/rajondas/.air1/air1_ast_guard.py"
-        out = subprocess.run([guard_bin, script_path, "--json"], capture_output=True, text=True)
-        assert out.returncode == 0
-        data = json.loads(out.stdout)
-        assert data["total_errors"] >= 1  # shell=True flagged as ERROR
-        assert data["total_warnings"] >= 2  # json & glob imports flagged as WARNING
+        # Standard mode should exit with code 1 due to banned imports / shell=True
+        out_fail = subprocess.run([guard_bin, script_path, "--json"], capture_output=True, text=True)
+        assert out_fail.returncode == 1
+        data_fail = json.loads(out_fail.stdout)
+        assert data_fail["total_errors"] >= 3  # json, glob, shell=True
+        assert data_fail["total_warnings"] >= 2  # pickle, urllib.request
+
+        # Warn-only mode should exit with code 0 while still reporting findings
+        out_warn = subprocess.run([guard_bin, script_path, "--json", "--warn-only"], capture_output=True, text=True)
+        assert out_warn.returncode == 0
+        data_warn = json.loads(out_warn.stdout)
+        assert data_warn["warn_only"] is True
+        assert data_warn["total_errors"] >= 3
+        assert data_warn["total_warnings"] >= 2
     finally:
         if os.path.exists(script_path):
             os.remove(script_path)
