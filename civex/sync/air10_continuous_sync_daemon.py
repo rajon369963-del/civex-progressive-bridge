@@ -286,14 +286,42 @@ class ContinuumSyncEngine:
                 status_report[name] = f"ERROR: {e}"
         return status_report
 
+    def run_loop(self, interval: float = 5.0, max_iterations: Optional[int] = None):
+        """Runs the continuous synchronization loop with graceful interval delays."""
+        print(f"[*] Starting Continuum Sync Daemon loop (interval={interval}s)...")
+        iteration = 0
+        try:
+            while max_iterations is None or iteration < max_iterations:
+                iteration += 1
+                queued = self.scan_and_journal(max_files_per_scan=25)
+                if queued > 0:
+                    print(f"[{time.strftime('%X')}] Queued {queued} modified files for sync.")
+                    uploaded = self.upload_pending(batch_size=10)
+                    print(f"[{time.strftime('%X')}] Upload batch results: {len(uploaded)} files processed.")
+                    self.verify_readback(sample_size=1)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n[*] Continuum Sync Daemon gracefully stopped.")
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="AIR10 Continuous Convergence & Live Backup Daemon")
+    parser.add_argument("--daemon", action="store_true", help="Run continuously as background daemon")
+    parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds")
+    parser.add_argument("--preflight", action="store_true", help="Run a single preflight cycle and exit")
+    args = parser.parse_args()
+
     engine = ContinuumSyncEngine()
-    print("=== AIR10 CONTINUUM SYNC ENGINE PREFLIGHT ===")
-    queued = engine.scan_and_journal(max_files_per_scan=20)
-    print(f"Queued files for sync: {queued}")
-    uploaded = engine.upload_pending(batch_size=5)
-    print(f"Uploaded results: {uploaded}")
-    verified = engine.verify_readback(sample_size=1)
-    print(f"Readback integrity: {verified}")
-    git_clean = engine.check_federation_git_cleanliness()
-    print(f"Git Cleanliness: {git_clean}")
+    if args.daemon:
+        engine.run_loop(interval=args.interval)
+    else:
+        print("=== AIR10 CONTINUUM SYNC ENGINE PREFLIGHT ===")
+        queued = engine.scan_and_journal(max_files_per_scan=20)
+        print(f"Queued files for sync: {queued}")
+        uploaded = engine.upload_pending(batch_size=5)
+        print(f"Uploaded results: {uploaded}")
+        verified = engine.verify_readback(sample_size=1)
+        print(f"Readback integrity: {verified}")
+        git_clean = engine.check_federation_git_cleanliness()
+        print(f"Git Cleanliness: {git_clean}")
+
