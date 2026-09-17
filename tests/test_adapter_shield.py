@@ -83,8 +83,9 @@ def test_type_coercion_boolean_and_numbers():
 # 2. ANTI-STORM 5-SECOND DEDUPLICATION TESTS
 # ---------------------------------------------------------------------------
 def test_anti_storm_5s_deduplication_filter():
+    DedupShield.clear_cache()
     tool = "run_command"
-    args = {"CommandLine": "ls -la"}
+    args = {"CommandLine": f"ls -la test_{time.time_ns()}"}
     
     # First call: allowed
     is_dup1, msg1 = DedupShield.check_and_record(tool, args)

@@ -168,6 +168,15 @@ class DedupShield:
 
         return False, "PROCEED"
 
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clears the deduplication cache file for hermetic test isolation."""
+        if os.path.exists(DEDUP_CACHE_FILE):
+            try:
+                os.remove(DEDUP_CACHE_FILE)
+            except OSError:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # 3. SYNTAX SANITIZER & PANIC PROBE BLOCKER

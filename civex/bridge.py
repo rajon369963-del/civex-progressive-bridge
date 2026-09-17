@@ -723,6 +723,30 @@ def main(argv: list[str] | None = None) -> int:
     thin_p = subparsers.add_parser("thin-snapshots", help="Govern APFS local snapshots bloat")
     thin_p.add_argument("--bytes", type=int, default=10_000_000_000, help="Target bytes to thin")
 
+    # memory-hydrate (Sub-20ms Guru-Shishya Memory Context Hydration)
+    hyd_m = subparsers.add_parser("memory-hydrate", help="Hydrate in-process memory prompt block under 20ms")
+    hyd_m.add_argument("query", nargs="?", default="", help="Query for semantic recall")
+    hyd_m.add_argument("--limit", type=int, default=4, help="Max memories to recall")
+
+    # memory-record (Atomic Episodic Memory Persistence)
+    rec_m = subparsers.add_parser("memory-record", help="Record episodic memory in SQLite WAL")
+    rec_m.add_argument("category", help="Category")
+    rec_m.add_argument("content", help="Memory text content")
+    rec_m.add_argument("--tone", default="NEUTRAL", help="Emotional tone")
+    rec_m.add_argument("--importance", type=float, default=1.0, help="Importance score")
+    rec_m.add_argument("--async", dest="async_write", action="store_true", help="Record asynchronously")
+
+    # memory-search (FTS5 BM25 Memory Search)
+    search_m = subparsers.add_parser("memory-search", help="Search episodic memories via FTS5 BM25")
+    search_m.add_argument("query", help="Keywords")
+    search_m.add_argument("--limit", type=int, default=5, help="Max results")
+
+    # memory-stats (Physical Row Counts & WAL Health)
+    subparsers.add_parser("memory-stats", help="Get SQLite WAL stats and row counts")
+
+    # memory-drain (Drain background writeback queue)
+    subparsers.add_parser("memory-drain", help="Flush background write queue")
+
     args = parser.parse_args(argv)
 
     try:
@@ -804,6 +828,44 @@ def main(argv: list[str] | None = None) -> int:
         from civex.root_eradication_engine import DiskBloatGovernor
         res = DiskBloatGovernor.thin_apfs_snapshots(target_bytes=args.bytes)
         print(json.dumps(res, indent=2))
+        return 0
+    elif args.command == "memory-hydrate":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        block = interceptor.before_turn(args.query, session_id="civex_cli", limit=args.limit)
+        print(block)
+        return 0
+    elif args.command == "memory-record":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        res = interceptor.record_episodic(
+            content=args.content,
+            category=args.category,
+            emotional_tone=args.tone,
+            importance=args.importance,
+            async_write=args.async_write
+        )
+        if args.async_write:
+            interceptor.flush()
+        print(json.dumps({"status": "SUCCESS", "result": res}))
+        return 0
+    elif args.command == "memory-search":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        results = interceptor.search_memories(args.query, limit=args.limit)
+        print(json.dumps(results, indent=2))
+        return 0
+    elif args.command == "memory-stats":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        stats = interceptor.get_stats()
+        print(json.dumps(stats, indent=2))
+        return 0
+    elif args.command == "memory-drain":
+        from civex.memory_interceptor import GuruShishyaLifecycleInterceptor
+        interceptor = GuruShishyaLifecycleInterceptor(db_path=args.db_path)
+        interceptor.flush()
+        print(json.dumps({"status": "DRAINED"}))
         return 0
 
     return 0
