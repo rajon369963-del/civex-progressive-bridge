@@ -704,6 +704,25 @@ def main(argv: list[str] | None = None) -> int:
     ver_p.add_argument("pre_hash", help="Pre-execution SHA-256 hash")
     ver_p.add_argument("--code", type=int, default=0, help="Exit code")
 
+    # intercept (AST Preflight Shell Interceptor)
+    int_p = subparsers.add_parser("intercept", help="Inspect and sanitize shell commands (AST preflight)")
+    int_p.add_argument("cmd", help="Command line string to inspect")
+    int_p.add_argument("--cwd", default=None, help="Current working directory context")
+
+    # adapt (Fail-Closed MCP Schema Adapter & JSON Stream Repair)
+    adapt_p = subparsers.add_parser("adapt", help="Normalize MCP tool arguments and repair JSON stream")
+    adapt_p.add_argument("tool", help="Target tool name")
+    adapt_p.add_argument("payload", help="Raw JSON string or file path")
+
+    # preflight (Compound Anti-Storm Dedup + Schema Adapter)
+    pref_p = subparsers.add_parser("preflight", help="Compound preflight tool call (anti-storm + adapter)")
+    pref_p.add_argument("tool", help="Target tool name")
+    pref_p.add_argument("payload", help="Raw JSON string or file path")
+
+    # thin-snapshots (Disk Bloat Governor)
+    thin_p = subparsers.add_parser("thin-snapshots", help="Govern APFS local snapshots bloat")
+    thin_p.add_argument("--bytes", type=int, default=10_000_000_000, help="Target bytes to thin")
+
     args = parser.parse_args(argv)
 
     try:
@@ -738,6 +757,54 @@ def main(argv: list[str] | None = None) -> int:
         res = verifier.verify_causal_write(args.path, args.pre_hash, args.code)
         print(json.dumps(res, indent=2))
         return 0 if res["verdict"] == "CONFIRMED" else 1
+    elif args.command == "intercept":
+        from civex.root_eradication_engine import ASTShellInterceptor
+        sanitized, modified, reason = ASTShellInterceptor.intercept(args.cmd, cwd=args.cwd)
+        out = {
+            "sanitized_command": sanitized,
+            "was_modified": modified,
+            "reason": reason
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+    elif args.command == "adapt":
+        from civex.root_eradication_engine import SchemaAdapterShield
+        raw = args.payload
+        if os.path.exists(raw):
+            with open(raw, "r", encoding="utf-8") as f:
+                raw = f.read()
+        parsed, repaired = SchemaAdapterShield.repair_json_stream(raw)
+        norm_args, mutated = SchemaAdapterShield.normalize_mcp_arguments(args.tool, parsed)
+        out = {
+            "tool": args.tool,
+            "normalized_args": norm_args,
+            "repaired_json": repaired,
+            "was_mutated": mutated
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+    elif args.command == "preflight":
+        from civex.root_eradication_engine import RootEradicationEngine, SchemaAdapterShield
+        raw = args.payload
+        if os.path.exists(raw):
+            with open(raw, "r", encoding="utf-8") as f:
+                raw = f.read()
+        parsed, _ = SchemaAdapterShield.repair_json_stream(raw)
+        engine = RootEradicationEngine()
+        norm_args, allowed, reason = engine.preflight_tool_call(args.tool, parsed)
+        out = {
+            "tool": args.tool,
+            "normalized_args": norm_args,
+            "allowed": allowed,
+            "reason": reason
+        }
+        print(json.dumps(out, indent=2))
+        return 0 if allowed else 1
+    elif args.command == "thin-snapshots":
+        from civex.root_eradication_engine import DiskBloatGovernor
+        res = DiskBloatGovernor.thin_apfs_snapshots(target_bytes=args.bytes)
+        print(json.dumps(res, indent=2))
+        return 0
 
     return 0
 
