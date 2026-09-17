@@ -30,7 +30,7 @@
     "mmap_size_bytes": 268435456,
     "episodic_memories_count": 23,
     "episodic_fts_count": 23,
-    "shishya_profile_count": 3,
+    "shishya_profile_count": 4,
     "session_turns_count": 2,
     "cognitive_errors_count": 1,
     "measured_hydration_ms": 0.82
@@ -43,8 +43,10 @@
     "no_autoplay": true,
     "climax": "\u092d\u093e\u0908, \u0938\u092c\u0938\u0947 interesting \u091a\u0940\u091c\u093c \u091c\u094b \u0928\u093f\u0915\u0932\u0940 \u0935\u094b \u092f\u0947 \u0939\u0948...",
     "file_path": "/Users/rajondas/teamwork_projects/civex-progressive-bridge/civex_phase3_cherry_on_top_player.html",
-    "brain_path": "/Users/rajondas/.gemini/antigravity/brain/0fbbfc94-52ad-4694-870a-30a6962f9c7c/civex_phase3_cherry_on_top_player.html",
-    "size_bytes": 2804713
+    "brain_path": "/Users/rajondas/.gemini/antigravity/brain/464c6cf9-8bca-4b28-88a1-a635a0235a33/civex_phase3_cherry_on_top_player.html",
+    "size_bytes": 2804713,
+    "audio_transcript_reference": "/Users/rajondas/teamwork_projects/civex-progressive-bridge/PHASE3_AUDIO_TRANSCRIPT.md",
+    "audio_transcript_brain_path": "/Users/rajondas/.gemini/antigravity/brain/464c6cf9-8bca-4b28-88a1-a635a0235a33/PHASE3_AUDIO_TRANSCRIPT.md"
   },
   "completion_ledger_state": "PROVEN_DONE"
 }
