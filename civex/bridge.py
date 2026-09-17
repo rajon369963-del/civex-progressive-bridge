@@ -681,7 +681,7 @@ def inspect_tool_metadata(tool_id: str, catalog_path: Path | str | None = None) 
 def main(argv: list[str] | None = None) -> int:
     """CLI Entry point for civex-bridge console script."""
     parser = argparse.ArgumentParser(description="CIVEX Progressive 2-Tier Tool Bridge")
-    parser.add_argument("--db", dest="db_path", default=None, help="Custom SQLite catalog database path")
+    parser.add_argument("--db", "--db-path", dest="db_path", default=None, help="Custom SQLite catalog database path")
     subparsers = parser.add_subparsers(dest="command")
 
     # search
@@ -727,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     hyd_m = subparsers.add_parser("memory-hydrate", help="Hydrate in-process memory prompt block under 20ms")
     hyd_m.add_argument("query", nargs="?", default="", help="Query for semantic recall")
     hyd_m.add_argument("--limit", type=int, default=4, help="Max memories to recall")
+    hyd_m.add_argument("--db", "--db-path", dest="db_path", default=None, help="Custom SQLite memory database path")
 
     # memory-record (Atomic Episodic Memory Persistence)
     rec_m = subparsers.add_parser("memory-record", help="Record episodic memory in SQLite WAL")
@@ -735,11 +736,13 @@ def main(argv: list[str] | None = None) -> int:
     rec_m.add_argument("--tone", default="NEUTRAL", help="Emotional tone")
     rec_m.add_argument("--importance", type=float, default=1.0, help="Importance score")
     rec_m.add_argument("--async", dest="async_write", action="store_true", help="Record asynchronously")
+    rec_m.add_argument("--db", "--db-path", dest="db_path", default=None, help="Custom SQLite memory database path")
 
     # memory-search (FTS5 BM25 Memory Search)
     search_m = subparsers.add_parser("memory-search", help="Search episodic memories via FTS5 BM25")
     search_m.add_argument("query", help="Keywords")
     search_m.add_argument("--limit", type=int, default=5, help="Max results")
+    search_m.add_argument("--db", "--db-path", dest="db_path", default=None, help="Custom SQLite memory database path")
 
     # memory-stats (Physical Row Counts & WAL Health)
     subparsers.add_parser("memory-stats", help="Get SQLite WAL stats and row counts")

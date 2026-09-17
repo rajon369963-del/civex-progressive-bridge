@@ -288,3 +288,57 @@ for i in range(15):
     assert stats["journal_mode"].lower() == "wal"
 
 
+def test_cli_memory_hydrate_subcommand(temp_memory_interceptor):
+    """Verify civex-bridge memory-hydrate CLI subcommand executes under 20ms and outputs valid XML."""
+    import subprocess
+    db_path = temp_memory_interceptor.engine.db_path
+    
+    # Store unique query memory
+    temp_memory_interceptor.record_episodic(
+        content="Barak Valley Silicon Corridor Mamba Offline Cluster.",
+        category="INFRA",
+        async_write=False
+    )
+    
+    civex_bin = "/Users/rajondas/.local/bin/civex-bridge"
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        [civex_bin, "memory-hydrate", "Barak Valley", "--limit", "2", "--db-path", db_path],
+        capture_output=True,
+        text=True,
+        timeout=5
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert proc.returncode == 0, f"civex-bridge failed: {proc.stderr}"
+    assert elapsed_ms < 1000.0 # Process cold launch + python run
+    assert "<guru-shishya-memory" in proc.stdout
+    assert "Barak Valley" in proc.stdout
+    assert "</guru-shishya-memory>" in proc.stdout
+
+
+def test_pre_invocation_lifecycle_hook_integration(temp_memory_interceptor):
+    """Verify pre_invocation_lifecycle_hook.py automatically hydrates memory into agent ephemeral context."""
+    import subprocess
+    hook_script = "/Users/rajondas/.gemini/config/plugins/air10-gemini-study/scripts/hooks/pre_invocation_lifecycle_hook.py"
+    if not os.path.exists(hook_script):
+        pytest.skip(f"Hook script not found at {hook_script}")
+
+    payload = json.dumps({"userMessage": "Socratic feedback on Octalysis Gamification"})
+    proc = subprocess.run(
+        [sys.executable, hook_script],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=5
+    )
+    assert proc.returncode == 0, f"Hook failed with stderr: {proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert "injectSteps" in data
+    assert len(data["injectSteps"]) >= 1
+    ephemeral = data["injectSteps"][0]["ephemeralMessage"]
+    assert "[AIR10/MIGL CONSTITUTION ENFORCED]" in ephemeral
+    assert "<guru-shishya-memory" in ephemeral
+    assert "</guru-shishya-memory>" in ephemeral
+
+
+

@@ -74,7 +74,7 @@ class GuruShishyaLifecycleInterceptor:
 
     @classmethod
     def get_instance(cls, db_path: Optional[str] = None, json_path: Optional[str] = None) -> "GuruShishyaLifecycleInterceptor":
-        if cls._instance is None:
+        if cls._instance is None or (db_path and getattr(cls._instance.engine, "db_path", None) != db_path):
             cls._instance = cls(db_path=db_path, json_path=json_path)
         return cls._instance
 
