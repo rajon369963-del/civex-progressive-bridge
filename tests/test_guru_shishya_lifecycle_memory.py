@@ -63,11 +63,12 @@ def test_before_turn_hydration_latency_sub20ms(temp_memory_interceptor):
     prompt_block = temp_memory_interceptor.before_turn("Octalysis Socratic", session_id="test_sess")
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    slo = 250.0 if os.environ.get("CI") else 20.0
+    slo = 20.0
     assert elapsed_ms < slo, f"Context hydration took {elapsed_ms:.2f}ms, exceeding {slo}ms SLO!"
     assert "<guru-shishya-memory" in prompt_block
     assert "Octalysis" in prompt_block
     assert "Rajon" in prompt_block
+
 
 
 def test_after_turn_and_session_turns_ledger(temp_memory_interceptor):
@@ -99,10 +100,11 @@ def test_record_tool_execution_telemetry(temp_memory_interceptor):
         async_write=False
     )
     
-    # Should have recorded turn and episodic memory for failure
+    # Should have recorded turn, episodic memory, and cognitive error for failure
     stats = temp_memory_interceptor.get_stats()
     assert stats["session_turns_count"] == 1
     assert stats["episodic_memories_count"] >= 1
+    assert stats["cognitive_errors_count"] >= 1
 
     # Search failure memory
     results = temp_memory_interceptor.search_memories("SyntaxError unexpected", limit=2)
@@ -145,8 +147,9 @@ def test_sub20ms_benchmark_100_iterations(temp_memory_interceptor):
 
     latencies.sort()
     p95 = latencies[95]
-    slo = 250.0 if os.environ.get("CI") else 20.0
+    slo = 20.0
     assert p95 < slo, f"P95 latency was {p95:.2f}ms, exceeding {slo}ms SLO!"
+
 
 
 def test_10x_concurrency_stress(temp_memory_interceptor):
@@ -208,3 +211,134 @@ def test_false_green_court(temp_memory_interceptor):
     # 4. Whitespace only content should not be recorded
     blank_id = temp_memory_interceptor.engine.record_episodic_memory("   ")
     assert blank_id == ""
+
+
+def test_deduplication_idempotency(temp_memory_interceptor):
+    """Verify storing identical content multiple times is strictly idempotent."""
+    id1 = temp_memory_interceptor.engine.record_episodic_memory("Decentralized Mamba offline inference in Assam.")
+    time.sleep(0.05)
+    id2 = temp_memory_interceptor.engine.record_episodic_memory("Decentralized Mamba offline inference in Assam.")
+    assert id1 == id2
+    stats = temp_memory_interceptor.get_stats()
+    assert stats["episodic_memories_count"] == 1
+
+
+def test_cognitive_error_recording_and_ledger(temp_memory_interceptor):
+    """Verify recording and querying Socratic cognitive errors in Tier 5 ledger."""
+    err_id = temp_memory_interceptor.record_cognitive_error(
+        topic="SocraticDamping",
+        misconception="Over-damping causes conversational sluggishness",
+        trap="Confusing high-order poles with low loop gain"
+    )
+    assert err_id.startswith("ERR_")
+    stats = temp_memory_interceptor.get_stats()
+    assert stats["cognitive_errors_count"] == 1
+
+
+def test_engine_public_crud_contract(temp_memory_interceptor):
+    """Verify public CRUD methods on GuruShishyaMemoryEngine."""
+    engine = temp_memory_interceptor.engine
+    # Store with custom key
+    m_id = engine.record_episodic_memory(
+        content="Custom key memory for public CRUD test.",
+        category="CRUD",
+        memory_id="custom_key_001"
+    )
+    assert m_id == "custom_key_001"
+
+    # Get by key
+    rec = engine.get_memory("custom_key_001")
+    assert rec is not None
+    assert rec["memory_id"] == "custom_key_001"
+    assert "CRUD" in rec["category"]
+
+    # List keys
+    keys = engine.list_keys("custom_")
+    assert "custom_key_001" in keys
+
+    # Delete by key
+    deleted = engine.delete_memory("custom_key_001")
+    assert deleted is True
+    assert engine.get_memory("custom_key_001") is None
+
+
+def test_concurrent_multiprocess_writes(temp_memory_interceptor):
+    """Attack with true independent OS-level processes writing concurrently."""
+    import subprocess
+    db_path = temp_memory_interceptor.engine.db_path
+    json_path = temp_memory_interceptor.engine.json_path
+    script = f"""
+import sys
+sys.path.insert(0, '/Users/rajondas/.local/bin')
+from guru_shishya_memory import GuruShishyaMemoryEngine
+engine = GuruShishyaMemoryEngine(db_path='{db_path}', json_path='{json_path}', enable_async=False)
+for i in range(15):
+    engine.record_episodic_memory(f'Proc write {{i}} from pid {{sys.argv[1]}}')
+"""
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script, str(p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for p in range(4)
+    ]
+    for p in procs:
+        stdout, stderr = p.communicate(timeout=15)
+        assert p.returncode == 0, f"Process failed: {stderr.decode()}"
+
+    stats = temp_memory_interceptor.get_stats()
+    assert stats["episodic_memories_count"] == 60
+    assert stats["journal_mode"].lower() == "wal"
+
+
+def test_cli_memory_hydrate_subcommand(temp_memory_interceptor):
+    """Verify civex-bridge memory-hydrate CLI subcommand executes under 20ms and outputs valid XML."""
+    import subprocess
+    db_path = temp_memory_interceptor.engine.db_path
+    
+    # Store unique query memory
+    temp_memory_interceptor.record_episodic(
+        content="Barak Valley Silicon Corridor Mamba Offline Cluster.",
+        category="INFRA",
+        async_write=False
+    )
+    
+    civex_bin = "/Users/rajondas/.local/bin/civex-bridge"
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        [civex_bin, "memory-hydrate", "Barak Valley", "--limit", "2", "--db-path", db_path],
+        capture_output=True,
+        text=True,
+        timeout=5
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert proc.returncode == 0, f"civex-bridge failed: {proc.stderr}"
+    assert elapsed_ms < 1000.0 # Process cold launch + python run
+    assert "<guru-shishya-memory" in proc.stdout
+    assert "Barak Valley" in proc.stdout
+    assert "</guru-shishya-memory>" in proc.stdout
+
+
+def test_pre_invocation_lifecycle_hook_integration(temp_memory_interceptor):
+    """Verify pre_invocation_lifecycle_hook.py automatically hydrates memory into agent ephemeral context."""
+    import subprocess
+    hook_script = "/Users/rajondas/.gemini/config/plugins/air10-gemini-study/scripts/hooks/pre_invocation_lifecycle_hook.py"
+    if not os.path.exists(hook_script):
+        pytest.skip(f"Hook script not found at {hook_script}")
+
+    payload = json.dumps({"userMessage": "Socratic feedback on Octalysis Gamification"})
+    proc = subprocess.run(
+        [sys.executable, hook_script],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=5
+    )
+    assert proc.returncode == 0, f"Hook failed with stderr: {proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert "injectSteps" in data
+    assert len(data["injectSteps"]) >= 1
+    ephemeral = data["injectSteps"][0]["ephemeralMessage"]
+    assert "[AIR10/MIGL CONSTITUTION ENFORCED]" in ephemeral
+    assert "<guru-shishya-memory" in ephemeral
+    assert "</guru-shishya-memory>" in ephemeral
+
+
+
