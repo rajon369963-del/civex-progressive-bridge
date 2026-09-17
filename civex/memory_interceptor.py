@@ -26,6 +26,14 @@ from typing import Any, Dict, List, Optional
 GURU_SCRIPT_PATH = os.path.expanduser("~/.local/bin/guru_shishya_memory.py")
 
 def _load_guru_engine_class():
+    # 1. First attempt package import
+    try:
+        from civex.guru_shishya_memory import GuruShishyaMemoryEngine
+        return GuruShishyaMemoryEngine
+    except ImportError:
+        pass
+
+    # 2. Dynamic import from ~/.local/bin/guru_shishya_memory.py if present
     if os.path.exists(GURU_SCRIPT_PATH):
         spec = importlib.util.spec_from_file_location("guru_shishya_memory", GURU_SCRIPT_PATH)
         if spec and spec.loader:
@@ -34,7 +42,7 @@ def _load_guru_engine_class():
             spec.loader.exec_module(mod)
             return getattr(mod, "GuruShishyaMemoryEngine")
     
-    # Fallback to local import if already on path
+    # 3. Fallback to global namespace import
     try:
         from guru_shishya_memory import GuruShishyaMemoryEngine
         return GuruShishyaMemoryEngine
