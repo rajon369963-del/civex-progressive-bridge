@@ -59,9 +59,9 @@ class AsyncMemoryWriter:
             return False
 
     def _worker_loop(self) -> None:
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() or not self.queue.empty():
             try:
-                task = self.queue.get(timeout=0.1)
+                task = self.queue.get(timeout=0.05)
             except queue.Empty:
                 continue
 
@@ -92,17 +92,16 @@ class AsyncMemoryWriter:
             finally:
                 self.queue.task_done()
 
-    def flush(self, timeout: float = 5.0) -> None:
+    def flush(self, timeout: float = 2.0) -> None:
         """Wait for all pending writes in the queue to be committed."""
-        try:
-            self.queue.join()
-        except Exception:
-            pass
+        deadline = time.time() + timeout
+        while self.queue.unfinished_tasks > 0 and time.time() < deadline:
+            time.sleep(0.005)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 2.0) -> None:
         """Gracefully drain and stop worker thread."""
+        self.flush(timeout=timeout)
         self._stop_event.set()
-        self.flush(timeout=2.0)
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
@@ -664,15 +663,15 @@ class GuruShishyaMemoryEngine:
         except Exception:
             pass
 
-    def flush(self) -> None:
+    def flush(self, timeout: float = 2.0) -> None:
         """Drains the background write queue."""
         if self.async_writer:
-            self.async_writer.flush()
+            self.async_writer.flush(timeout=timeout)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 2.0) -> None:
         """Drains background queue and releases resources."""
         if self.async_writer:
-            self.async_writer.shutdown()
+            self.async_writer.shutdown(timeout=timeout)
         self.close()
 
 

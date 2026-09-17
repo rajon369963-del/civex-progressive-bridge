@@ -226,7 +226,7 @@ class GuruShishyaLifecycleInterceptor:
         """Returns SQLite WAL row counts and memory health stats."""
         return self.engine.get_stats()
 
-    def flush(self) -> None:
+    def flush(self, timeout: float = 2.0) -> None:
         """Flushes background write queue."""
-        self.engine.flush()
+        self.engine.flush(timeout=timeout)
 
