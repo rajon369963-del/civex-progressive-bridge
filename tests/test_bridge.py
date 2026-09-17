@@ -268,6 +268,27 @@ def test_cli_entrypoint():
     assert ret == 0, f"civex-bridge search failed with exit code {ret}"
     print("  ✅ [PASS] civex-bridge search returned exit code 0")
 
+    # Test CLI intercept (AST preflight shell interceptor)
+    ret_int = main(["intercept", "find / -name test.sqlite", "--cwd", "/tmp"])
+    assert ret_int == 0, f"civex-bridge intercept failed with exit code {ret_int}"
+    print("  ✅ [PASS] civex-bridge intercept returned exit code 0")
+
+    # Test CLI adapt (Playwright / MCP parameter coercion)
+    ret_adapt = main(["adapt", "browser_evaluate", '{"script": "document.title"}'])
+    assert ret_adapt == 0, f"civex-bridge adapt failed with exit code {ret_adapt}"
+    print("  ✅ [PASS] civex-bridge adapt returned exit code 0")
+
+    # Test CLI preflight (Anti-storm + schema normalization)
+    ret_pref = main(["preflight", "browser_evaluate", '{"script": "1+1"}'])
+    assert ret_pref in (0, 1)
+    print("  ✅ [PASS] civex-bridge preflight executed cleanly")
+
+    # Test CLI thin-snapshots (Disk Bloat Governor)
+    ret_thin = main(["thin-snapshots", "--bytes", "1000000000"])
+    assert ret_thin == 0, f"civex-bridge thin-snapshots failed with exit code {ret_thin}"
+    print("  ✅ [PASS] civex-bridge thin-snapshots returned exit code 0")
+
+
 
 def test_civex_causal_assertions():
     print("\n--- [TEST 6] CIVEX CAUSAL INTERVENTION ASSERTIONS ---")
