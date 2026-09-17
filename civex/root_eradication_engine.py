@@ -137,14 +137,58 @@ class SchemaAdapterShield:
             except Exception:
                 pass
 
-        # Fallback regex repair for unclosed braces
+        # Fallback repair for unclosed quotes and braces
         stripped = raw_payload.strip()
-        if stripped.startswith("{") and not stripped.endswith("}"):
-            try:
-                repaired = json.loads(stripped + "}")
-                return repaired, True
-            except json.JSONDecodeError:
-                pass
+        if stripped.startswith("{"):
+            in_string = False
+            escape = False
+            stack = []
+            for char in stripped:
+                if escape:
+                    escape = False
+                    continue
+                if char == "\\":
+                    if in_string:
+                        escape = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if char in ("{", "["):
+                        stack.append(char)
+                    elif char == "}" and stack and stack[-1] == "{":
+                        stack.pop()
+                    elif char == "]" and stack and stack[-1] == "[":
+                        stack.pop()
+
+            closing_chars = "".join("}" if c == "{" else "]" for c in reversed(stack))
+
+            candidates = []
+            if in_string:
+                candidates.append(stripped + '"' + closing_chars)
+                candidates.append(stripped + '": null' + closing_chars)
+                candidates.append(stripped + '"}')
+                last_comma = stripped.rfind(",")
+                if last_comma != -1:
+                    candidates.append(stripped[:last_comma] + closing_chars)
+            else:
+                candidates.append(stripped + closing_chars)
+                trimmed = stripped.rstrip(" ,:")
+                if trimmed != stripped:
+                    candidates.append(trimmed + closing_chars)
+                last_comma = stripped.rfind(",")
+                if last_comma != -1:
+                    candidates.append(stripped[:last_comma] + closing_chars)
+                candidates.append(stripped + "}")
+
+            for cand in candidates:
+                try:
+                    repaired = json.loads(cand)
+                    if isinstance(repaired, dict):
+                        return repaired, True
+                except (json.JSONDecodeError, ValueError):
+                    pass
 
         return {}, False
 

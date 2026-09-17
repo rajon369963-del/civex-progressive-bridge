@@ -26,7 +26,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+    "partialjson",
+]
 
 [project.urls]
 Homepage = "https://github.com/rajon369963-del/civex-progressive-bridge"
