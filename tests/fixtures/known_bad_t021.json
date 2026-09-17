@@ -1,0 +1,12 @@
+{
+  "project": "civex-progressive-bridge",
+  "task": "T021",
+  "support_contract": {
+    "contract_id": "CONTRACT-CIRCULAR-001",
+    "tier": "enterprise_gold",
+    "sla_ms": 50,
+    "signer": "self_signed_unauthorized_agent",
+    "digest": "SELF_SEALED_CIRCULAR_FAKE_DIGEST_HASH_00000000000000000000000000000000"
+  },
+  "is_self_sealed": true
+}
