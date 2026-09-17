@@ -62,12 +62,11 @@ class ASTShellInterceptor:
     Inspects shell commands before execution to arrest panic probe storms
     and strip hallucinated flags from native CLI binaries.
     """
-    PANIC_ROOT_PATTERNS = [
-        re.compile(r"\bfind\s+/\s+(?!Users|tmp|var|private)"),
-        re.compile(r"\bgrep\s+-[rnwI]*\s+.*?\s+/(?!Users|tmp|var|private)"),
-        re.compile(r"\bcat\s+/etc/(passwd|shadow|hosts)"),
-        re.compile(r"\bls\s+-[laR]*\s+/(?!Users|tmp|var|private)")
-    ]
+    PAT_FIND = re.compile(r"\bfind\s+/(?:\s+(?!Users|tmp|var|private|Volumes|opt)|$)")
+    PAT_LS = re.compile(r"(\bls(?:\s+-[a-zA-Z0-9]+)*)\s+/(?:\s+(?!Users|tmp|var|private|Volumes|opt)|$)")
+    PAT_GREP = re.compile(r"(\b(?:grep|egrep)(?:\s+-[a-zA-Z0-9]+)*\s+.*?\s+)/(?:\s+(?!Users|tmp|var|private|Volumes|opt)|$)")
+    PAT_RG = re.compile(r"(\brg(?:\s+-[a-zA-Z0-9]+)*\s+.*?\s+)/(?:\s+(?!Users|tmp|var|private|Volumes|opt)|$)")
+    PAT_CAT_SENSITIVE = re.compile(r"\bcat\s+/etc/(passwd|shadow|hosts)")
 
     FLAG_STRIP_RULES = {
         "gorun-fast": [r"--json", r"-j", r"--format\s+json"],
@@ -87,12 +86,26 @@ class ASTShellInterceptor:
         raw = command.strip()
         workspace = cwd or os.getcwd()
 
-        # 1. Check for panic root sweeps
-        for pattern in cls.PANIC_ROOT_PATTERNS:
-            if pattern.search(raw):
-                # Safely redirect root sweep to current workspace
-                sanitized = pattern.sub(f"find {workspace} ", raw)
-                return sanitized, True, f"Panic root probe intercepted: redirected '/' to '{workspace}'"
+        # 1. Check for panic root sweeps with command-preserving redirection
+        if cls.PAT_FIND.search(raw):
+            sanitized = cls.PAT_FIND.sub(f"find {workspace} ", raw).strip()
+            return sanitized, True, f"Panic root probe intercepted: redirected '/' to '{workspace}'"
+
+        if cls.PAT_LS.search(raw):
+            sanitized = cls.PAT_LS.sub(rf"\1 {workspace} ", raw).strip()
+            return sanitized, True, f"Panic root probe intercepted: redirected '/' to '{workspace}'"
+
+        if cls.PAT_GREP.search(raw):
+            sanitized = cls.PAT_GREP.sub(rf"\1{workspace} ", raw).strip()
+            return sanitized, True, f"Panic root probe intercepted: redirected '/' to '{workspace}'"
+
+        if cls.PAT_RG.search(raw):
+            sanitized = cls.PAT_RG.sub(rf"\1{workspace} ", raw).strip()
+            return sanitized, True, f"Panic root probe intercepted: redirected '/' to '{workspace}'"
+
+        if cls.PAT_CAT_SENSITIVE.search(raw):
+            sanitized = cls.PAT_CAT_SENSITIVE.sub(r'echo "Restricted file probe blocked: /etc/\1"', raw).strip()
+            return sanitized, True, "Panic root probe intercepted: sensitive system file read blocked"
 
         # 2. Strip hallucinated flags on native binaries
         for binary, patterns in cls.FLAG_STRIP_RULES.items():

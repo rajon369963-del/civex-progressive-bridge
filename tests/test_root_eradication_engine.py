@@ -27,12 +27,48 @@ from civex.root_eradication_engine import (
 
 
 def test_ast_shell_interceptor_panic_root():
-    cmd = "find / -name credentials.env"
     workspace = "/Users/rajondas/teamwork_projects"
+
+    # 1. find / with arguments
+    cmd = "find / -name credentials.env"
     sanitized, modified, reason = ASTShellInterceptor.intercept(cmd, cwd=workspace)
     assert modified is True
-    assert "find /Users/rajondas/teamwork_projects" in sanitized
+    assert sanitized == "find /Users/rajondas/teamwork_projects -name credentials.env"
     assert "Panic root probe intercepted" in reason
+
+    # 2. standalone find /
+    sanitized2, mod2, _ = ASTShellInterceptor.intercept("find /", cwd=workspace)
+    assert mod2 is True
+    assert sanitized2 == "find /Users/rajondas/teamwork_projects"
+
+    # 3. ls / and ls -la /
+    sanitized_ls, mod_ls, _ = ASTShellInterceptor.intercept("ls /", cwd=workspace)
+    assert mod_ls is True
+    assert sanitized_ls == "ls /Users/rajondas/teamwork_projects"
+
+    sanitized_ls_la, mod_ls_la, _ = ASTShellInterceptor.intercept("ls -la /", cwd=workspace)
+    assert mod_ls_la is True
+    assert sanitized_ls_la == "ls -la /Users/rajondas/teamwork_projects"
+
+    # 4. grep -rn and plain grep
+    sanitized_grep, mod_grep, _ = ASTShellInterceptor.intercept("grep -rn foo /", cwd=workspace)
+    assert mod_grep is True
+    assert sanitized_grep == "grep -rn foo /Users/rajondas/teamwork_projects"
+
+    # 5. ripgrep
+    sanitized_rg, mod_rg, _ = ASTShellInterceptor.intercept("rg secret /", cwd=workspace)
+    assert mod_rg is True
+    assert sanitized_rg == "rg secret /Users/rajondas/teamwork_projects"
+
+    # 6. cat /etc/passwd
+    sanitized_cat, mod_cat, _ = ASTShellInterceptor.intercept("cat /etc/passwd", cwd=workspace)
+    assert mod_cat is True
+    assert "blocked" in sanitized_cat
+
+    # 7. non-root paths should not be intercepted
+    sanitized_safe, mod_safe, _ = ASTShellInterceptor.intercept("ls /tmp", cwd=workspace)
+    assert mod_safe is False
+    assert sanitized_safe == "ls /tmp"
 
 
 def test_ast_shell_interceptor_strip_flags():
@@ -159,3 +195,25 @@ def test_unified_root_eradication_engine():
     norm, ok, reason = engine.preflight_tool_call("browser_evaluate", {"script": "1 + 1"})
     assert ok is True
     assert norm["function"] == "() => { return (1 + 1); }"
+
+
+def test_phase3_civex_cli_subcommands():
+    from civex.bridge import main
+    # 1. intercept
+    assert main(["intercept", "find / -name secret.txt"]) == 0
+    # 2. adapt
+    assert main(["adapt", "playwright:browser_evaluate", '{"script": "document.title"}']) == 0
+    # 3. preflight
+    assert main(["preflight", "browser_tabs", "{}"]) == 0
+    # 4. thin-snapshots
+    assert main(["thin-snapshots", "--bytes", "1000000"]) == 0
+
+
+def test_phase3_lifecycle_hook_panic_interception(tmp_path):
+    from civex.root_eradication_engine import ASTShellInterceptor
+    cmd = "find / -type f -name test.py"
+    clean, mod, reason = ASTShellInterceptor.intercept(cmd, cwd=str(tmp_path))
+    assert mod is True
+    assert str(tmp_path) in clean
+    assert "Panic root probe" in reason
+
