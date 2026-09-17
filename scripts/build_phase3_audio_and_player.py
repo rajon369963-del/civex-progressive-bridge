@@ -298,17 +298,23 @@ html_content = f'''<!DOCTYPE html>
 </html>
 '''
 
-# Write to civex repo and brain folder
+# Write to civex repo and current conversation brain folder
 dest_repo = "/Users/rajondas/teamwork_projects/civex-progressive-bridge/civex_phase3_cherry_on_top_player.html"
-dest_brain = "/Users/rajondas/.gemini/antigravity/brain/7dc4390a-b505-4cb0-9f4b-79c468afbba6/civex_phase3_cherry_on_top_player.html"
+dest_brain_current = "/Users/rajondas/.gemini/antigravity/brain/93f2b937-da5d-4bff-b503-4b72eb32a561/civex_phase3_cherry_on_top_player.html"
+dest_brain_legacy = "/Users/rajondas/.gemini/antigravity/brain/7dc4390a-b505-4cb0-9f4b-79c468afbba6/civex_phase3_cherry_on_top_player.html"
 
 with open(dest_repo, "w", encoding="utf-8") as f:
     f.write(html_content)
 print("Written to repo:", dest_repo, "Size:", os.path.getsize(dest_repo))
 
-with open(dest_brain, "w", encoding="utf-8") as f:
+with open(dest_brain_current, "w", encoding="utf-8") as f:
     f.write(html_content)
-print("Written to brain:", dest_brain, "Size:", os.path.getsize(dest_brain))
+print("Written to current brain:", dest_brain_current, "Size:", os.path.getsize(dest_brain_current))
+
+if os.path.exists(os.path.dirname(dest_brain_legacy)):
+    with open(dest_brain_legacy, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print("Written to legacy brain:", dest_brain_legacy, "Size:", os.path.getsize(dest_brain_legacy))
 
 # Write updated transcript markdown
 transcript_md = f"""# 🍒 Phase 3: Antigravity Ultimate Cherry-on-Top — Audio Masterclass Transcript
